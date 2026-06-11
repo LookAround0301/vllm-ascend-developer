@@ -102,6 +102,28 @@ python -c "import paramiko, yaml; print('ok')"
 5. 分析模型输出文件（检查乱码、复读）
 6. 根据结果决定是否进入修复迭代
 
+### 重新安装 aisbench（容器内）
+
+Docker 容器内自带的 `ais-bench-benchmark` 版本可能不兼容，需要先卸载再重新从源码安装：
+
+```bash
+# 1. 卸载旧版本
+pip uninstall ais-bench-benchmark -y
+
+# 2. 清理残留文件
+rm -rf /usr/local/python3.11.10/lib/python3.11/site-packages/ais_bench/
+
+# 3. 克隆并安装 benchmark
+git clone https://github.com/AISBench/benchmark.git
+pip3 install -e ./benchmark --use-pep517 -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 4. 安装依赖
+pip3 install -r ./benchmark/requirements/api.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip3 install -r ./benchmark/requirements/extra.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+> **说明**：容器内预装的 aisbench 可能与 [aisbench_auto_tools_prefix](https://github.com/rayn-zzz/aisbench_auto_tools_prefix) 不兼容，使用前务必按上述步骤重装。
+
 ### 核心要求
 
 > **重要**：aisbench 评测必须在 vLLM 服务完全启动并通过健康检查后才能执行，严禁在服务未就绪时发起评测。
