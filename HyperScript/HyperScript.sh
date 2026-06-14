@@ -13,7 +13,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 # ==================== 代理配置 ====================
-DEFAULT_PROXY_IP="141.1.51.7"
+DEFAULT_PROXY_IP="141.1.51.6"
 DEFAULT_PROXY_PORT="8080"
 
 # ==================== Docker 容器配置 ====================
@@ -29,6 +29,9 @@ DEFAULT_VLLM_INSTALL_DIR="$(pwd)"
 DEFAULT_VLLM_ASCEND_INSTALL_DIR="$(pwd)"
 
 # ==================== 运行时状态 ====================
+
+# 脚本所在目录(定位同级附带文件, 如 statusline.py)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ==================== Claude Code 配置 ====================
 # x86: linux-x64
@@ -887,7 +890,7 @@ install_claude_code() {
     fi
 
     # ===== Step 1/4: 下载 Node.js =====
-    echo -e "\n${GREEN}── [1/4] 下载 Node.js ──${NC}"
+    echo -e "\n${GREEN}── [1/5] 下载 Node.js ──${NC}"
 
     if [ -f "${node_archive_path}" ]; then
         log_info "Node.js 压缩包已存在：${node_archive_path}"
@@ -904,7 +907,7 @@ install_claude_code() {
     fi
 
     # ===== Step 2/4: 解压 Node.js + 配置环境变量 =====
-    echo -e "\n${GREEN}── [2/4] 解压 Node.js 并配置环境变量 ──${NC}"
+    echo -e "\n${GREEN}── [2/5] 解压 Node.js 并配置环境变量 ──${NC}"
 
     if [ -d "${node_extract_dir}" ]; then
         log_info "Node.js 已解压，跳过"
@@ -920,13 +923,15 @@ install_claude_code() {
     fi
 
     # 配置环境变量（持久化 + 当前会话）
-    sed -i '/# Claude Code 环境变量（由安装脚本添加）/,+2d' ~/.bashrc 2>/dev/null || true
+    sed -i '/# Claude Code 环境变量（由安装脚本添加）/,+3d' ~/.bashrc 2>/dev/null || true
     echo -e "\n# Claude Code 环境变量（由安装脚本添加）" >> ~/.bashrc
     echo "export PATH=${node_bin_dir}:\$PATH" >> ~/.bashrc
     echo "export NODE_TLS_REJECT_UNAUTHORIZED=0" >> ~/.bashrc
+    echo "export IS_SANDBOX=1" >> ~/.bashrc
 
     export PATH=${node_bin_dir}:$PATH
     export NODE_TLS_REJECT_UNAUTHORIZED=0
+    export IS_SANDBOX=1
 
     if node -v > /dev/null 2>&1; then
         log_success "Node.js $(node -v) / npm $(npm -v)"
@@ -938,7 +943,7 @@ install_claude_code() {
     fi
 
     # ===== Step 3/4: 安装 Claude Code =====
-    echo -e "\n${GREEN}── [3/4] 安装 Claude Code ──${NC}"
+    echo -e "\n${GREEN}── [3/5] 安装 Claude Code ──${NC}"
 
     log_info "配置 npm 镜像源..."
     npm config set strict-ssl false
@@ -978,35 +983,52 @@ install_claude_code() {
         fi
     fi
 
-    # ===== Step 4/4: 配置 settings.json =====
-    echo -e "\n${GREEN}── [4/4] 配置 Claude Code settings.json ──${NC}"
+    # ===== Step 4/5: 配置状态栏脚本 statusline.py =====
+    echo -e "\n${GREEN}── [4/5] 配置状态栏脚本 statusline.py ──${NC}"
 
     mkdir -p ~/.claude
-    cat > ~/.claude/settings.json << 'EOF'
+    local STATUSLINE_SRC="${SCRIPT_DIR}/statusline.py"
+    if [ -f "${STATUSLINE_SRC}" ]; then
+        cp "${STATUSLINE_SRC}" ~/.claude/statusline.py
+        chmod +x ~/.claude/statusline.py
+        log_info "状态栏脚本已从 ${STATUSLINE_SRC} 复制到 ~/.claude/statusline.py"
+    else
+        log_warn "未找到 ${STATUSLINE_SRC}，跳过状态栏安装(请确认仓库文件完整)"
+    fi
+
+    # ===== Step 5/5: 配置 settings.json =====
+    echo -e "\n${GREEN}── [5/5] 配置 Claude Code settings.json ──${NC}"
+
+    # 检测 python3 绝对路径, 写入 statusLine command, 保证跨机器可用
+    local CLAUDE_PYTHON
+    CLAUDE_PYTHON="$(command -v python3 || command -v python)"
+    if [ -z "${CLAUDE_PYTHON}" ]; then
+        log_warn "未找到 python3，状态栏将回退使用 python3（请确保运行时 PATH 可用）"
+        CLAUDE_PYTHON="python3"
+    fi
+
+    cat > ~/.claude/settings.json << EOF
 {
   "env": {
     "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
-    "ANTHROPIC_MODEL": "glm-5.1",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.1",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.1",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.1",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "glm-5.1",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "glm-5.1",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "GLM-5.1",
-    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-    "ANTHROPIC_AUTH_TOKEN": "YOUR_API_KEY_HERE",
-    "API_TIMEOUT_MS": "3000000",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-    "ENABLE_TOOL_SEARCH": "false"
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.2[1m]",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2[1m]",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.2[1m]",
+    "ANTHROPIC_API_KEY": "YOUR_API_KEY_HERE",
+    "API_TIMEOUT_MS": "3000000"
   },
   "outputStyle": "engineer-professional",
-  "skipDangerousModePermissionPrompt": true
+  "skipDangerousModePermissionPrompt": true,
+  "statusLine": {
+    "type": "command",
+    "command": "${CLAUDE_PYTHON} ${HOME}/.claude/statusline.py"
+  }
 }
 EOF
     log_info "settings.json 已写入 ~/.claude/settings.json"
-
-    log_warn "请修改 ~/.claude/settings.json 中的各项参数为你实际使用的模型API配置"
-    echo -e "${YELLOW}当前配置：${NC}"
+    log_warn "请修改 ~/.claude/settings.json 中的 ANTHROPIC_API_KEY 为你实际的 API Key"
+    echo -e "${YELLOW}当前配置（API Key 已用占位符代替）:${NC}"
     cat ~/.claude/settings.json
 
     # ===== 汇总 =====

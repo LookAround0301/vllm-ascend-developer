@@ -1,6 +1,9 @@
 # vllm-ascend-developer
 
-vLLM + vLLM-Ascend 框架下的通用开发与调试 Skill，覆盖推理精度诊断、服务管理、自动化测试与代码修复等场景。支持**单机**和**PD分离**两种部署模式。
+本仓库包含两个**同级组件**，一个是开发调试 Skill，一个是一键安装脚本：
+
+- **Skill（开发调试）**：vLLM + vLLM-Ascend 通用开发与调试 Skill，覆盖推理精度诊断、服务管理、自动化测试与代码修复，支持**单机**和**PD分离**两种部署模式。 → 见下方「Skill」章节
+- **HyperScript（一键安装）**：交互式 TUI 脚本，负责 vllm / vllm-ascend / Claude Code 安装，以及 Docker 容器与 NPU/进程管理。 → 见下方「HyperScript 一键安装脚本」章节
 
 ## 目录结构
 
@@ -9,13 +12,13 @@ vllm-ascend-developer/
 ├── SKILL.md                     # Skill 主入口（Claude Code 加载入口）
 ├── CLAUDE.md                    # Claude Code 项目指南
 ├── README.md                    # 本文件
-├── config/                      # 配置文件（使用前需根据实际环境修改）
+├── config/                      # 【Skill】配置文件（使用前需根据实际环境修改）
 │   ├── service.yaml             # 服务配置（部署模式、SSH、Docker、端口）
 │   ├── test.yaml                # 测试用例（端点、参数、prompt、预期输出）
 │   ├── model.yaml               # 模型路径与源码路径
 │   ├── aisbench.yaml            # aisbench 精度/性能评测配置
 │   └── proxy.yaml               # 网络代理配置（pip/git 公网访问）
-├── modules/                     # 核心模块
+├── modules/                     # 【Skill】核心模块
 │   ├── service.md               # 服务生命周期管理（启动/停止/健康检查）
 │   ├── test-runner.md           # 测试执行器（发送推理请求）
 │   ├── verifier.md              # 结果验证器（对比预期输出）
@@ -23,19 +26,30 @@ vllm-ascend-developer/
 │   ├── log-analyzer.md          # 日志分析器（错误分类与定位）
 │   ├── auto-fixer.md            # 自动修复引擎（迭代修复 + fix_N.md 记录）
 │   └── flashcomm-mtp-debug.md   # FlashComm + MTP 调试专项指南
-├── workflows/                   # 工作流
+├── workflows/                   # 【Skill】工作流
 │   └── precision-diagnosis.md   # 端到端精度诊断工作流
-├── scripts/                     # 工具脚本
+├── scripts/                     # 【Skill】工具脚本
 │   ├── ssh_utils.py             # SSH 远程执行（exec/wait/upload/download）
 │   └── generate_curl.py         # 从 config/test.yaml 生成 curl 测试脚本
-└── docs/                        # 调试经验文档
-    ├── dcp2tp4-precision-fix.md # DCP 精度调试案例（逐层对比 + float64 LSE merge）
-    └── pcp-hybrid-nan-fix.md    # PCP NaN 案例（bool mask fill_() 写回陷阱）
+├── docs/                        # 调试经验文档
+│   ├── dcp2tp4-precision-fix.md # DCP 精度调试案例（逐层对比 + float64 LSE merge）
+│   └── pcp-hybrid-nan-fix.md    # PCP NaN 案例（bool mask fill_() 写回陷阱）
+└── HyperScript/                 # 【一键安装脚本】与 Skill 同级
+    ├── HyperScript.sh           # 安装 vllm/vllm-ascend/Claude Code、容器/NPU/进程管理
+    └── statusline.py            # Claude Code 状态栏脚本（随 Claude Code 安装自动部署）
 ```
 
-## 快速开始
+> `SKILL.md`、`config/`、`modules/`、`workflows/`、`scripts/`、`docs/` 属于 **Skill**；`HyperScript/` 是独立的一键安装脚本。
 
-### 第零步：安装依赖
+---
+
+## Skill：vllm-ascend-developer
+
+Skill 主入口为 [`SKILL.md`](./SKILL.md)，提供精度诊断、服务管理、测试执行与自动修复等能力。
+
+### 快速开始
+
+#### 第零步：安装依赖
 
 ```bash
 pip install paramiko pyyaml -i https://pypi.tuna.tsinghua.edu.cn/simple
@@ -48,7 +62,7 @@ python -c "import paramiko, yaml; print('ok')"
 # 输出 ok
 ```
 
-### 第一步：配置环境
+#### 第一步：配置环境
 
 根据自己的实际环境，修改以下配置文件：
 
@@ -58,7 +72,7 @@ python -c "import paramiko, yaml; print('ok')"
 4. **`config/aisbench.yaml`** — 【可选】设置精度数据集评测参数
 5. **`config/proxy.yaml`** — 【可选】设置网络代理
 
-### 第二步：执行精度诊断工作流
+#### 第二步：执行精度诊断工作流
 
 按照 `workflows/precision-diagnosis.md` 中的步骤执行：
 
@@ -70,18 +84,18 @@ python -c "import paramiko, yaml; print('ok')"
 
 每次修复迭代记录在 `fix_N.md`（N 从 1 递增）。
 
-## 两种部署模式
+### 两种部署模式
 
 | 模式 | 说明 | 适用场景 |
 |------|------|----------|
 | **standalone**（单机） | prefill 与 decode 在同一台机器上混合调度 | 单台 NPU 服务器，开发测试 |
 | **pd-separated**（PD分离） | P 节点（prefill）与 D 节点（decode）分离部署，通过 proxy 协调 | 大规模分布式推理，独立扩缩容 |
 
-## 精度 / 性能评测（aisbench）
+### 精度 / 性能评测（aisbench）
 
 对于数据集级别的精度验证和性能压测，推荐使用 [aisbench_auto_tools_prefix](https://github.com/rayn-zzz/aisbench_auto_tools_prefix)。
 
-### 工具简介
+#### 工具简介
 
 `aisbench_auto_tools_prefix` 是一个基于 aisbench 的自动化评测工具，支持：
 
@@ -91,7 +105,7 @@ python -c "import paramiko, yaml; print('ok')"
 - **流式 / 非流式**：支持 `stream` 和 `text` 两种推理模式
 - **Thinking 模式**：支持 DeepSeek V3.1 等模型的 thinking 输出
 
-### 在本 Skill 中的集成
+#### 在本 Skill 中的集成
 
 评测机器通过 `config/aisbench.yaml` 配置，Skill 中的 `modules/aisbench-evaluator.md` 模块提供了完整的评测流程：
 
@@ -102,7 +116,7 @@ python -c "import paramiko, yaml; print('ok')"
 5. 分析模型输出文件（检查乱码、复读）
 6. 根据结果决定是否进入修复迭代
 
-### 重新安装 aisbench（容器内）
+#### 重新安装 aisbench（容器内）
 
 Docker 容器内自带的 `ais-bench-benchmark` 版本可能不兼容，需要先卸载再重新从源码安装：
 
@@ -124,18 +138,18 @@ pip3 install -r ./benchmark/requirements/extra.txt -i https://pypi.tuna.tsinghua
 
 > **说明**：容器内预装的 aisbench 可能与 [aisbench_auto_tools_prefix](https://github.com/rayn-zzz/aisbench_auto_tools_prefix) 不兼容，使用前务必按上述步骤重装。
 
-### 核心要求
+#### 核心要求
 
 > **重要**：aisbench 评测必须在 vLLM 服务完全启动并通过健康检查后才能执行，严禁在服务未就绪时发起评测。
 
-## 环境要求
+### 环境要求
 
 - 目标服务器已安装 Docker
 - 已配置 Ascend NPU 设备（`npu-smi` 可用）
 - vLLM 和 vLLM-Ascend 已在容器内预装
 - Python 3.x + paramiko + pyyaml
 
-## 注意事项
+### 注意事项
 
 1. **只修改 vllm-ascend 代码** — 禁止修改 vLLM 上游源码
 2. **每个 `ssh_utils exec` 命令独立执行** — 不同 exec 之间不可用 `&&` 链式连接
@@ -144,3 +158,52 @@ pip3 install -r ./benchmark/requirements/extra.txt -i https://pypi.tuna.tsinghua
 5. **启动耗时** — vLLM 服务启动通常需要 10 分钟以上
 6. **配置一致性** — 启动脚本和测试脚本中的端口、模型名称必须一致
 7. **密码保护** — 配置文件中含敏感信息，建议将 `config/` 加入 `.gitignore`
+
+---
+
+## HyperScript 一键安装脚本
+
+[`HyperScript/HyperScript.sh`](./HyperScript/HyperScript.sh) 是与 Skill 同级的独立组件，一个交互式 TUI 脚本（`↑↓` 移动、`空格/x` 多选、`Enter` 确认），把 vLLM-Ascend 开发环境的常用运维操作集中到一个菜单；也支持 CLI 参数非交互调用。默认配置（代理、镜像源、分支、Node 版本等）集中在脚本顶部的 `DEFAULT_*` 变量。
+
+### 功能概览
+
+| 菜单项 | 说明 |
+|--------|------|
+| **安装 vllm / vllm-ascend / 一键安装** | 从 GitHub 克隆源码 `pip install -e .`（清华源），支持手输或从远程分支列表选分支，安装前自动卸载旧版本；「一键安装」依次装两者。 |
+| **创建 vllm 容器** | 交互选择本地镜像与容器名，`docker run` 创建挂载全部 Ascend NPU 设备（`--privileged`、`--net=host`、`--shm-size=500g`）的开发容器，挂载 `/home`、`/data`、driver 等，可选创建后直接进入。 |
+| **万能杀** | 强制查杀 `python`/`torchrun`/`ray`/`vllm` 进程及其僵尸（defunct）父进程并停 ray 服务——排查卡死/残留进程时一键清理。 |
+| **停止所有运行容器** | 列出运行中容器，确认后批量 `docker stop`/`kill`（5s 超时保护，避免卡顿）。 |
+| **看看谁在用卡** | 解析 `npu-smi info` 进程区提取 PID，再用 `pwdx` 查每个进程工作目录，定位 NPU 占用者。 |
+| **安装 Claude Code** | 安装 Claude Code CLI，并自动部署状态栏与 `IS_SANDBOX` 等环境变量（详见下文）。 |
+| **清除代理** | 清理 `http(s)_proxy`/`no_proxy`/`GIT_SSL_NO_VERIFY` 环境变量，以及 `~/.bashrc`、`~/.pip/pip.conf`、`~/.gitconfig` 中的代理配置。 |
+
+### 安装 Claude Code（含状态栏）
+
+选择「安装 Claude Code」会自动完成 5 步：
+
+1. **Node.js**：华为云镜像下载解压，`PATH` 写入 `~/.bashrc`
+2. **Claude Code CLI**：npm 安装（淘宝源，失败依次回退腾讯云 / 华为云）
+3. **状态栏**：把同级 [`statusline.py`](./HyperScript/statusline.py) 复制到 `~/.claude/`，并写入 `settings.json` 的 `statusLine`（自动检测 `python3` 绝对路径，跨机器可用）
+4. **`settings.json`**：默认配置（GLM-5.2 端点、`CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000`、`outputStyle` 等），`ANTHROPIC_API_KEY` 仅留占位符 —— **需自行填入真实 Key**
+5. **环境变量**：`~/.bashrc` 追加 `IS_SANDBOX=1`、`NODE_TLS_REJECT_UNAUTHORIZED=0`（幂等，重复安装不会累积重复行）
+
+装完后的状态栏效果（随会话刷新自动更新）：
+
+```
+glm-5.2 | [EFFORT] high | [CTX] [▍░░░░░░░░░] 4% | [COST] $0.93 | [SPEED] 63 tok/s
+```
+
+依次显示：模型名 · 思考强度（effort）· 上下文进度条（绿 <50% / 黄 <80% / 红）· 累计花费 · 输出速度（tok/s）。
+
+### CLI 非交互用法
+
+```bash
+bash HyperScript/HyperScript.sh --install-claude-code [DIR]        # 安装 Claude Code
+bash HyperScript/HyperScript.sh --install-vllm-all [DIR]           # 一键安装 vllm + vllm-ascend
+bash HyperScript/HyperScript.sh --install-vllm [DIR] [REPO] [BRANCH]
+bash HyperScript/HyperScript.sh --install-vllm-ascend [DIR] [REPO] [BRANCH]
+bash HyperScript/HyperScript.sh --check-npu                        # 查看 NPU 占用者
+bash HyperScript/HyperScript.sh --kill-all                         # 万能杀
+bash HyperScript/HyperScript.sh --stop-all-containers              # 停止所有容器
+bash HyperScript/HyperScript.sh --help
+```
