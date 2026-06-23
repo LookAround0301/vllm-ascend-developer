@@ -8,44 +8,46 @@
 ## 目录结构
 
 ```
-vllm-ascend-developer/
-├── SKILL.md                     # Skill 主入口（Claude Code 加载入口）
-├── CLAUDE.md                    # Claude Code 项目指南
-├── README.md                    # 本文件
-├── config/                      # 【Skill】配置文件（使用前需根据实际环境修改）
-│   ├── service.yaml             # 服务配置（部署模式、SSH、Docker、端口）
-│   ├── test.yaml                # 测试用例（端点、参数、prompt、预期输出）
-│   ├── model.yaml               # 模型路径与源码路径
-│   ├── aisbench.yaml            # aisbench 精度/性能评测配置
-│   └── proxy.yaml               # 网络代理配置（pip/git 公网访问）
-├── modules/                     # 【Skill】核心模块
-│   ├── service.md               # 服务生命周期管理（启动/停止/健康检查）
-│   ├── test-runner.md           # 测试执行器（发送推理请求）
-│   ├── verifier.md              # 结果验证器（对比预期输出）
-│   ├── aisbench-evaluator.md    # 精度数据集评测（aisbench）
-│   ├── log-analyzer.md          # 日志分析器（错误分类与定位）
-│   ├── auto-fixer.md            # 自动修复引擎（迭代修复 + fix_N.md 记录）
-│   └── flashcomm-mtp-debug.md   # FlashComm + MTP 调试专项指南
-├── workflows/                   # 【Skill】工作流
-│   └── precision-diagnosis.md   # 端到端精度诊断工作流
-├── scripts/                     # 【Skill】工具脚本
-│   ├── ssh_utils.py             # SSH 远程执行（exec/wait/upload/download）
-│   └── generate_curl.py         # 从 config/test.yaml 生成 curl 测试脚本
-├── docs/                        # 调试经验文档
-│   ├── dcp2tp4-precision-fix.md # DCP 精度调试案例（逐层对比 + float64 LSE merge）
-│   └── pcp-hybrid-nan-fix.md    # PCP NaN 案例（bool mask fill_() 写回陷阱）
-└── HyperScript/                 # 【一键安装脚本】与 Skill 同级
-    ├── HyperScript.sh           # 安装 vllm/vllm-ascend/Claude Code、容器/NPU/进程管理
-    └── statusline.py            # Claude Code 状态栏脚本（随 Claude Code 安装自动部署）
+vllm-ascend-developer/                 # 仓库根
+├── README.md                          # 本文件
+├── HyperScript/                       # 【一键安装脚本】与 Skill 同级
+│   ├── HyperScript.sh                 # 安装 vllm/vllm-ascend/Claude Code、容器/NPU/进程管理
+│   ├── statusline.py                  # Claude Code 状态栏脚本（随 Claude Code 安装自动部署）
+│   └── clawd-term/                    # 终端桌宠（CodeNoNo/Bubu/Yi Er）：脚本 + 精灵图 + NOTICE
+└── vllm-ascend-developer/             # 【Skill】开发调试 Skill（Claude Code 加载入口）
+    ├── SKILL.md                       # Skill 主入口
+    ├── CLAUDE.md                      # Claude Code 项目指南
+    ├── config/                        # 配置文件（使用前需根据实际环境修改）
+    │   ├── service.yaml               # 服务配置（部署模式、SSH、Docker、端口）
+    │   ├── test.yaml                  # 测试用例（端点、参数、prompt、预期输出）
+    │   ├── model.yaml                 # 模型路径与源码路径
+    │   ├── aisbench.yaml              # aisbench 精度/性能评测配置
+    │   └── proxy.yaml                 # 网络代理配置（pip/git 公网访问）
+    ├── modules/                       # 核心模块
+    │   ├── service.md                 # 服务生命周期管理（启动/停止/健康检查）
+    │   ├── test-runner.md             # 测试执行器（发送推理请求）
+    │   ├── verifier.md                # 结果验证器（对比预期输出）
+    │   ├── aisbench-evaluator.md      # 精度数据集评测（aisbench）
+    │   ├── log-analyzer.md            # 日志分析器（错误分类与定位）
+    │   ├── auto-fixer.md              # 自动修复引擎（迭代修复 + fix_N.md 记录）
+    │   └── flashcomm-mtp-debug.md     # FlashComm + MTP 调试专项指南
+    ├── workflows/                     # 工作流
+    │   └── precision-diagnosis.md     # 端到端精度诊断工作流
+    ├── scripts/                       # 工具脚本
+    │   ├── ssh_utils.py               # SSH 远程执行（exec/wait/upload/download）
+    │   └── generate_curl.py           # 从 config/test.yaml 生成 curl 测试脚本
+    └── docs/                          # 调试经验文档
+        ├── dcp2tp4-precision-fix.md   # DCP 精度调试案例（逐层对比 + float64 LSE merge）
+        └── pcp-hybrid-nan-fix.md      # PCP NaN 案例（bool mask fill_() 写回陷阱）
 ```
 
-> `SKILL.md`、`config/`、`modules/`、`workflows/`、`scripts/`、`docs/` 属于 **Skill**；`HyperScript/` 是独立的一键安装脚本。
+> 仓库根 = `README.md` + `HyperScript/`（一键安装脚本）+ 同名子目录 `vllm-ascend-developer/`（Skill 全部文件：`SKILL.md`、`CLAUDE.md`、`config/`、`modules/`、`workflows/`、`scripts/`、`docs/`）。
 
 ---
 
 ## Skill：vllm-ascend-developer
 
-Skill 主入口为 [`SKILL.md`](./SKILL.md)，提供精度诊断、服务管理、测试执行与自动修复等能力。
+Skill 主入口为 [`vllm-ascend-developer/SKILL.md`](./vllm-ascend-developer/SKILL.md)，提供精度诊断、服务管理、测试执行与自动修复等能力。
 
 ### 快速开始
 
@@ -181,11 +183,34 @@ pip3 install -r ./benchmark/requirements/extra.txt -i https://pypi.tuna.tsinghua
 
 选择「安装 Claude Code」会自动完成 5 步：
 
-1. **Node.js**：华为云镜像下载解压，`PATH` 写入 `~/.bashrc`
-2. **Claude Code CLI**：npm 安装（淘宝源，失败依次回退腾讯云 / 华为云）
+1. **Node.js**：华为云镜像下载解压（默认 `v24.14.0` arm64），bin 目录写入 `PATH`
+2. **Claude Code CLI**：npm 安装（淘宝源 `registry.npmmirror.com`，失败依次回退腾讯云 / 华为云）
 3. **状态栏**：把同级 [`statusline.py`](./HyperScript/statusline.py) 复制到 `~/.claude/`，并写入 `settings.json` 的 `statusLine`（自动检测 `python3` 绝对路径，跨机器可用）
-4. **`settings.json`**：默认配置（GLM-5.2 端点、`CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000`、`outputStyle` 等），`ANTHROPIC_API_KEY` 仅留占位符 —— **需自行填入真实 Key**
-5. **环境变量**：`~/.bashrc` 追加 `IS_SANDBOX=1`、`NODE_TLS_REJECT_UNAUTHORIZED=0`（幂等，重复安装不会累积重复行）
+4. **`settings.json`**：写入 `~/.claude/settings.json`，默认内容如下（Haiku/Sonnet/Opus 三档全部映射到 `glm-5.2[1m]`，`ANTHROPIC_API_KEY` 仅留占位符 —— **需自行填入真实 Key**）：
+   ```json
+   {
+     "env": {
+       "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
+       "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
+       "ANTHROPIC_DEFAULT_HAIKU_MODEL":  "glm-5.2[1m]",
+       "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2[1m]",
+       "ANTHROPIC_DEFAULT_OPUS_MODEL":   "glm-5.2[1m]",
+       "ANTHROPIC_API_KEY": "YOUR_API_KEY_HERE",
+       "API_TIMEOUT_MS": "3000000",
+       "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
+     },
+     "outputStyle": "engineer-professional",
+     "skipDangerousModePermissionPrompt": true,
+     "statusLine": { "type": "command", "command": "<python3 绝对路径> ~/.claude/statusline.py" }
+   }
+   ```
+5. **环境变量**：`~/.bashrc` 追加以下 3 行（幂等——写入前先用 `sed` 删除旧的同名块，重复安装不会累积重复行）：
+   ```bash
+   export PATH=<node_bin_dir>:$PATH
+   export NODE_TLS_REJECT_UNAUTHORIZED=0
+   export IS_SANDBOX=1
+   ```
+6. **可选·终端桌宠**：5 步装完后会弹出 TUI 询问「是否配置终端桌宠」；选配置即自动装好一个跑在 tmux 窗格里、随 Claude Code 状态动的桌面宠物（内置 CodeNoNo/Bubu/Yi Er 三选一，详见下方「可选：终端桌宠」）。
 
 装完后的状态栏效果（随会话刷新自动更新）：
 
@@ -194,6 +219,26 @@ glm-5.2 | [EFFORT] high | [CTX] [▍░░░░░░░░░] 4% | [COST] $0.
 ```
 
 依次显示：模型名 · 思考强度（effort）· 上下文进度条（绿 <50% / 黄 <80% / 红）· 累计花费 · 输出速度（tok/s）。
+
+### 可选：终端桌宠（CodeNoNo / Bubu / Yi Er）
+
+选择「配置终端桌宠」后，会在 `~/.claude/pet/` 装一套**终端版**桌宠（与 GUI 版 clawd-on-desk 不同——无需图形桌面，headless SSH 终端即可用）：一只桌宠（**CodeNoNo / Bubu / Yi Er 三选一**）跑在 tmux 小窗格里，随 Claude Code 状态（思考 / 跑工具 / 完成 / 报错…）切换动画。
+
+- **形象**：直接渲染 [`awesome-codex-pet`](https://github.com/rullerzhou-afk/awesome-codex-pet) 的精灵图为终端字符画（ANSI 真彩色 + ▀ 半块），内置 3 个——**CodeNoNo / Bubu / Yi Er**，仓库自带 `HyperScript/clawd-term/{codenono,bubu,yier}.webp`，离线可用。
+- **换形象**：默认 `start.sh`（不传参）就弹菜单选（CodeNoNo / Bubu / Yi Er + 布局）；或 `PET_PET=bubu bash ~/.claude/pet/start.sh col` 直接指定（默认 `codenono`）。
+- **原理**：Claude Code hooks 把事件写成状态词 → `pet.py` 渲染对应动画帧 → 显示在 tmux 窗格。
+- **启动**：`bash ~/.claude/pet/start.sh`（不传参弹菜单，选形象 + 布局）；或直接 `start.sh col`/`bottom`/`mid` 指定布局。进入 tmux 后在主窗格跑 `claude`，桌宠随之动。
+- **清晰度/尺寸**：编辑 `~/.claude/pet/pet.py` 顶部 `PET_W`（默认 40，调大更清晰）。
+- **颜色**需终端支持真彩色（iTerm2 / Windows Terminal / kitty 等）；不行的话形状照常显示，可 `Ctrl+B : set -ag terminal-overrides ',*:Tc'` 开启。
+
+### 小贴士：翻看 Claude Code 的历史上下文
+
+Claude Code **经典模式**下，鼠标滚轮和 `PgUp/PgDn` 都翻不了对话历史（claude 的输出在备用屏幕，不在终端 scrollback 里）。要看历史内容，二选一：
+
+- **全屏模式（推荐）**：会话里 `/tui fullscreen` → 用 `PgUp/PgDn` 翻历史；全屏下鼠标滚轮也能滚（需 tmux 里 `Ctrl+B :` `set -g mouse on`）。全屏不影响右侧桌宠（独立窗格）。
+- **任意模式**：按 `Ctrl+O` 进 transcript 审阅（`j/k` 翻、`Ctrl+u/d` 半屏、`/` 搜索、`q` 退出）。
+
+> 想让全屏成为默认：在 `~/.claude/settings.json` 的 `env` 里加 `"CLAUDE_CODE_NO_FLICKER": "1"`，**改完必须重启 claude 才生效**。
 
 ### CLI 非交互用法
 

@@ -13,7 +13,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 # ==================== 代理配置 ====================
-DEFAULT_PROXY_IP="141.1.51.6"
+DEFAULT_PROXY_IP="141.3.169.143"
 DEFAULT_PROXY_PORT="8080"
 
 # ==================== Docker 容器配置 ====================
@@ -1016,7 +1016,8 @@ install_claude_code() {
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2[1m]",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.2[1m]",
     "ANTHROPIC_API_KEY": "YOUR_API_KEY_HERE",
-    "API_TIMEOUT_MS": "3000000"
+    "API_TIMEOUT_MS": "3000000",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
   },
   "outputStyle": "engineer-professional",
   "skipDangerousModePermissionPrompt": true,
@@ -1035,6 +1036,114 @@ EOF
     echo
     log_success "Claude Code 安装完成"
     log_info "Node.js: $(node -v) | npm: $(npm -v) | Claude Code: $(claude -v 2>/dev/null || echo 'unavailable')"
+
+    # ===== 可选：配置终端桌宠 (CodeNoNo) =====
+    if ask_pet_install; then
+        install_clawd_pet
+    else
+        log_info "已跳过终端桌宠配置（之后可手动重跑本步或 bash ~/.claude/pet/start.sh）"
+    fi
+}
+
+# ==================== 终端桌宠 (clawd-term / CodeNoNo) ====================
+
+# 安装终端桌宠：tmux + Pillow + 脚本 + CodeNoNo 精灵图 + 注册 Claude Code hooks
+install_clawd_pet() {
+    echo -e "\n${GREEN}── 配置终端桌宠 (clawd-term · CodeNoNo) ──${NC}"
+    local PET_DIR="${HOME}/.claude/pet"
+    local SRC_DIR="${SCRIPT_DIR}/clawd-term"
+    if [ -z "${SCRIPT_DIR:-}" ]; then
+        SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-"$0"}")" 2>/dev/null && pwd)/clawd-term"
+    fi
+
+    # 1) 依赖：tmux / python3 / Pillow
+    command -v tmux >/dev/null 2>&1 || {
+        log_info "安装 tmux ..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -o Acquire::Retries=8 --no-install-recommends tmux >/dev/null 2>&1 \
+            || { log_warn "tmux 安装失败，请手动 apt-get install tmux"; return 1; }
+    }
+    command -v python3 >/dev/null 2>&1 || { log_warn "缺少 python3"; return 1; }
+    python3 -c "from PIL import Image" 2>/dev/null || {
+        log_info "安装 Pillow ..."
+        pip3 install -q -i https://pypi.tuna.tsinghua.edu.cn/simple pillow >/dev/null 2>&1 \
+            || { log_warn "Pillow 安装失败，请手动 pip3 install pillow"; return 1; }
+    }
+
+    # 2) 拷贝桌宠脚本
+    mkdir -p "$PET_DIR"
+    if [ -d "$SRC_DIR" ]; then
+        cp -f "$SRC_DIR"/pet.py "$SRC_DIR"/hook.sh "$SRC_DIR"/start.sh "$SRC_DIR"/merge_hooks.py "$PET_DIR/" 2>/dev/null
+        chmod +x "$PET_DIR"/pet.py "$PET_DIR"/hook.sh "$PET_DIR"/start.sh 2>/dev/null
+        log_info "桌宠脚本 -> ${PET_DIR}"
+    else
+        log_warn "未找到 ${SRC_DIR}（伴生 clawd-term/ 缺失），脚本拷贝跳过"
+    fi
+
+    # 3) 精灵图：codenono / bubu / yier -> ~/.claude/pet/<name>.webp（仓库自带 > 本地 awesome-codex-pet）
+    local name DST DEV_P
+    for name in codenono bubu yier; do
+        DST="$PET_DIR/$name.webp"
+        case "$name" in
+            codenono) DEV_P="/home/l00889328/dev/awesome-codex-pet/pets/codenono--dq02/spritesheet.webp" ;;
+            bubu)     DEV_P="/home/l00889328/dev/awesome-codex-pet/pets/bubu--gbn666/spritesheet.webp" ;;
+            yier)     DEV_P="/home/l00889328/dev/awesome-codex-pet/pets/yier--gbn666/spritesheet.webp" ;;
+        esac
+        if [ -f "$DST" ]; then
+            :
+        elif [ -f "$SRC_DIR/$name.webp" ]; then
+            cp -f "$SRC_DIR/$name.webp" "$DST"; log_info "精灵图 $name <- 仓库自带"
+        elif [ -f "$DEV_P" ]; then
+            cp -f "$DEV_P" "$DST"; log_info "精灵图 $name <- 本地 awesome-codex-pet"
+        else
+            log_warn "缺 $name.webp（可手动放到 $DST）"
+        fi
+    done
+
+    # 4) 注册 Claude Code hooks（幂等，自动备份 settings.json.bak-pet）
+    if [ -f "$PET_DIR/merge_hooks.py" ] && [ -f "${HOME}/.claude/settings.json" ]; then
+        python3 "$PET_DIR/merge_hooks.py" >/dev/null 2>&1 \
+            && log_info "hooks 已写入 ~/.claude/settings.json" \
+            || log_warn "hooks 注册失败，可手动 python3 $PET_DIR/merge_hooks.py"
+    fi
+
+    echo
+    log_success "终端桌宠配置完成"
+    echo -e "  启动：${GREEN}bash ~/.claude/pet/start.sh${NC}（弹菜单选形象+布局）；或直接 ${GREEN}start.sh col${NC} / bottom / mid"
+    echo -e "  进入 tmux 后在主窗格运行 ${GREEN}claude${NC}，桌宠随状态动；分离 Ctrl+B D。"
+    echo -e "  清晰度/尺寸：编辑 ${YELLOW}~/.claude/pet/pet.py${NC} 顶部 ${YELLOW}PET_W${NC}（默认 40）。"
+    echo -e "  内置 3 个形象（CodeNoNo/Bubu/Yi Er）：${GREEN}bash ~/.claude/pet/start.sh${NC} 弹菜单选；或 ${GREEN}PET_PET=bubu${NC}（/yier/codenono）直接指定。"
+    echo -e "  翻看 claude 历史：经典模式滚轮/PgUp 翻不了——用 ${GREEN}/tui fullscreen${NC} 后 ${GREEN}PgUp/PgDn${NC}，或按 ${GREEN}Ctrl+O${NC} 进 transcript 审阅。"
+}
+
+# TUI 二选一：是否配置终端桌宠。返回 0=配置，1=跳过（↑↓ 选择，Enter 确认）
+ask_pet_install() {
+    local cursor=0 key
+    local items=("配置终端桌宠 (CodeNoNo) —— tmux 窗格里随 Claude Code 状态动的桌面宠物" "跳过（之后可手动配置）")
+    tput civis 2>/dev/null
+    while true; do
+        clear
+        echo -e "${GREEN}========================================${NC}"
+        echo -e "${GREEN}  可选：是否配置终端桌宠？${NC}"
+        echo -e "${GREEN}========================================${NC}"
+        for i in 0 1; do
+            if [ "$i" -eq "$cursor" ]; then
+                echo -e "\e[7m> ${items[$i]}\e[0m"
+            else
+                echo -e "  ${items[$i]}"
+            fi
+        done
+        echo -e "${YELLOW}  ↑↓ 选择，Enter 确认${NC}"
+        IFS= read -rsn1 key
+        if [[ "$key" == $'\x1b' ]]; then
+            IFS= read -rsn2 -t 0.1 key
+            [[ "$key" == "[A" ]] && cursor=$(( (cursor - 1 + 2) % 2 ))
+            [[ "$key" == "[B" ]] && cursor=$(( (cursor + 1) % 2 ))
+            continue
+        fi
+        [[ "$key" == "" ]] && break
+    done
+    tput cnorm 2>/dev/null
+    [ "$cursor" -eq 0 ]
 }
 
 # ==================== 菜单与主入口 ====================
@@ -1254,7 +1363,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 echo "  --install-vllm [DIR] [REPO] [BRANCH]   安装vllm（默认: 当前目录, $DEFAULT_VLLM_REPO, $DEFAULT_VLLM_BRANCH）"
                 echo "  --install-vllm-ascend [DIR] [REPO] [BRANCH]  安装vllm-ascend（默认: 当前目录, $DEFAULT_VLLM_ASCEND_REPO, $DEFAULT_VLLM_ASCEND_BRANCH）"
                 echo "  --install-vllm-all [DIR]               一键安装vllm+vllm-ascend（默认: 当前目录）"
-                echo "  --install-claude-code [DIR]            安装Claude Code"
+                echo "  --install-claude-code [DIR]            安装Claude Code（末尾可选配置终端桌宠，内置 CodeNoNo/Bubu/Yi Er）"
                 echo "  --help                                 显示此帮助信息"
                 exit 0
                 ;;
