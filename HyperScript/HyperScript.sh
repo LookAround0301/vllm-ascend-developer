@@ -1150,7 +1150,7 @@ ask_pet_install() {
 
 # TUI 多选菜单（上下键导航，空格/x 多选，回车确认）
 show_tui_menu() {
-    local n=10
+    local n=11
     local cursor=0
     local i key mark
 
@@ -1163,11 +1163,12 @@ show_tui_menu() {
     local opt6="停止所有运行容器"
     local opt7="看看谁在用卡"
     local opt8="安装 Claude Code"
-    local opt9="清除代理"
-    local opt10="退出"
+    local opt9="安装终端桌宠（需先装 Claude Code）"
+    local opt10="清除代理"
+    local opt11="退出"
 
     # 选中状态（全局数组，0=未选 1=已选）
-    _TUI_CHK=(0 0 0 0 0 0 0 0 0)
+    _TUI_CHK=(0 0 0 0 0 0 0 0 0 0)
 
     tput civis 2>/dev/null  # 隐藏光标
 
@@ -1189,7 +1190,7 @@ show_tui_menu() {
                 0) desc="$opt1" ;; 1) desc="$opt2" ;; 2) desc="$opt3" ;;
                 3) desc="$opt4" ;; 4) desc="$opt5" ;; 5) desc="$opt6" ;;
                 6) desc="$opt7" ;; 7) desc="$opt8" ;; 8) desc="$opt9" ;;
-                9) desc="$opt10" ;;
+                9) desc="$opt10" ;; 10) desc="$opt11" ;;
             esac
             if [ "${_TUI_CHK[$i]}" = "1" ]; then
                 mark="✓"
@@ -1301,9 +1302,12 @@ main() {
                     install_claude_code "$DEFAULT_CLAUDE_CODE_INSTALL_DIR"
                     ;;
                 9)
-                    clear_proxy
+                    install_clawd_pet
                     ;;
                 10)
+                    clear_proxy
+                    ;;
+                11)
                     log_info "退出脚本"
                     exit 0
                     ;;
@@ -1344,6 +1348,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 install_claude_code "${2:-$DEFAULT_CLAUDE_CODE_INSTALL_DIR}"
                 exit 0
                 ;;
+            --install-clawd-pet)
+                install_clawd_pet
+                exit 0
+                ;;
             --install-vllm)
                 install_vllm "${2:-$DEFAULT_VLLM_INSTALL_DIR}" "${3:-$DEFAULT_VLLM_REPO}" "${4:-$DEFAULT_VLLM_BRANCH}"
                 exit 0
@@ -1364,6 +1372,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 echo "  --install-vllm-ascend [DIR] [REPO] [BRANCH]  安装vllm-ascend（默认: 当前目录, $DEFAULT_VLLM_ASCEND_REPO, $DEFAULT_VLLM_ASCEND_BRANCH）"
                 echo "  --install-vllm-all [DIR]               一键安装vllm+vllm-ascend（默认: 当前目录）"
                 echo "  --install-claude-code [DIR]            安装Claude Code（末尾可选配置终端桌宠，内置 CodeNoNo/Bubu/Yi Er）"
+                echo "  --install-clawd-pet                   单独安装终端桌宠（CodeNoNo/Bubu/Yi Er）"
                 echo "  --help                                 显示此帮助信息"
                 exit 0
                 ;;

@@ -177,6 +177,7 @@ pip3 install -r ./benchmark/requirements/extra.txt -i https://pypi.tuna.tsinghua
 | **停止所有运行容器** | 列出运行中容器，确认后批量 `docker stop`/`kill`（5s 超时保护，避免卡顿）。 |
 | **看看谁在用卡** | 解析 `npu-smi info` 进程区提取 PID，再用 `pwdx` 查每个进程工作目录，定位 NPU 占用者。 |
 | **安装 Claude Code** | 安装 Claude Code CLI，并自动部署状态栏与 `IS_SANDBOX` 等环境变量（详见下文）。 |
+| **安装终端桌宠** | 单独安装终端桌宠（CodeNoNo/Bubu/Yi Er 三选一），跑在 tmux 窗格里随 Claude Code 状态动；**需先装 Claude Code**。 |
 | **清除代理** | 清理 `http(s)_proxy`/`no_proxy`/`GIT_SSL_NO_VERIFY` 环境变量，以及 `~/.bashrc`、`~/.pip/pip.conf`、`~/.gitconfig` 中的代理配置。 |
 
 ### 安装 Claude Code（含状态栏）
@@ -244,6 +245,7 @@ Claude Code **经典模式**下，鼠标滚轮和 `PgUp/PgDn` 都翻不了对话
 
 ```bash
 bash HyperScript/HyperScript.sh --install-claude-code [DIR]        # 安装 Claude Code
+bash HyperScript/HyperScript.sh --install-clawd-pet                # 单独安装终端桌宠（CodeNoNo/Bubu/Yi Er）
 bash HyperScript/HyperScript.sh --install-vllm-all [DIR]           # 一键安装 vllm + vllm-ascend
 bash HyperScript/HyperScript.sh --install-vllm [DIR] [REPO] [BRANCH]
 bash HyperScript/HyperScript.sh --install-vllm-ascend [DIR] [REPO] [BRANCH]

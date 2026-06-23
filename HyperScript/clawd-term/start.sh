@@ -34,11 +34,7 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
     exec tmux attach -t "$SESSION"
 fi
 
-# 问 pet.py 螃蟹的贴合尺寸（宽 高）
-read CRAB_W CRAB_H < <(PET_SIZE=mini PET_SIZE_ONLY=1 python3 "${PET_DIR}/pet.py") || true
-CRAB_W="${CRAB_W:-13}"; CRAB_H="${CRAB_H:-4}"
-
-# ---- 交互式菜单：start.sh pick（先选形象，再选布局）----
+# ---- 交互式菜单：start.sh 不传参（先选形象，再选布局）----
 choose_pet() {
     local names=("codenono" "bubu" "yier")
     local labels=("CodeNoNo（机器人）" "Bubu" "Yi Er（一二）")
@@ -104,20 +100,24 @@ if [ "$MODE" = "pick" ]; then
     MODE="$LAYOUT"
 fi
 
+# 探测「当前形象(PET_PET)」的贴合尺寸（宽 高）——必须在菜单之后，才能匹配所选形象
+read FIT_W FIT_H < <(PET_SIZE=mini PET_SIZE_ONLY=1 python3 "${PET_DIR}/pet.py") || true
+FIT_W="${FIT_W:-40}"; FIT_H="${FIT_H:-24}"
+
 tmux new-session -d -s "$SESSION"
-# 隐藏窗格分隔线（边框颜色 = 背景），螃蟹看着像浮在 claude 右边
+# 隐藏窗格分隔线（边框颜色 = 背景），桌宠看着像浮在 claude 右边
 tmux set-option -t "$SESSION" pane-border-style "fg=black" 2>/dev/null || true
 tmux set-option -t "$SESSION" pane-active-border-style "fg=black" 2>/dev/null || true
 case "$MODE" in
     col)
-        # 右侧整高窄列：col [宽]。单窗格、无空白；螃蟹由 pet.py 垂直居中。
-        W="${2:-$CRAB_W}"
+        # 右侧整高窄列：col [宽]。单窗格、无空白；桌宠由 pet.py 垂直居中。
+        W="${2:-$FIT_W}"
         if [ "${W}" -le 10 ] 2>/dev/null; then SZ=tiny; else SZ=mini; fi
         tmux split-window -h -t "$SESSION":0.0 -l "$W" "PET_SIZE=${SZ} python3 ${PET_DIR}/pet.py; sh"
         ;;
     mid)
         # 右侧正中小方格：mid [宽] [高]。上下用 tail 静默留白（tmux 切小格必然剩空白）。
-        W="${2:-$CRAB_W}"; C="${3:-$CRAB_H}"
+        W="${2:-$FIT_W}"; C="${3:-$FIT_H}"
         if [ "${W}" -le 10 ] 2>/dev/null; then SZ=tiny; else SZ=mini; fi
         tmux split-window -h -t "$SESSION":0.0 -l "$W"
         tmux split-window -v -t "$SESSION":0.1
@@ -135,8 +135,8 @@ case "$MODE" in
         tmux split-window -v -t "$SESSION":0.0 -l 9 "PET_SIZE=big python3 ${PET_DIR}/pet.py; sh"
         ;;
     bottom|*)
-        # 底部窄条：bottom [高]，默认=螃蟹高。claude 保持满宽，只占底部几行。
-        BH="${2:-$CRAB_H}"
+        # 底部窄条：bottom [高]，默认=桌宠高。claude 保持满宽，只占底部几行。
+        BH="${2:-$FIT_H}"
         tmux split-window -v -t "$SESSION":0.0 -l "$BH" "PET_SIZE=mini python3 ${PET_DIR}/pet.py; sh"
         ;;
 esac
