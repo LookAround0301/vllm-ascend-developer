@@ -110,8 +110,8 @@ tmux set-option -t "$SESSION" pane-border-style "fg=black" 2>/dev/null || true
 tmux set-option -t "$SESSION" pane-active-border-style "fg=black" 2>/dev/null || true
 case "$MODE" in
     col)
-        # 右侧整高窄列：col [宽]。单窗格、无空白；桌宠由 pet.py 垂直居中。
-        W="${2:-$FIT_W}"
+        # 右侧窄列：col [宽]，默认=桌宠宽+24（留横向漂移空间，左右也能动）。
+        W="${2:-$((FIT_W + 24))}"
         if [ "${W}" -le 10 ] 2>/dev/null; then SZ=tiny; else SZ=mini; fi
         tmux split-window -h -t "$SESSION":0.0 -l "$W" "PET_SIZE=${SZ} python3 ${PET_DIR}/pet.py; sh"
         ;;

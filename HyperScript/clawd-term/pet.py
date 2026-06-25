@@ -10,6 +10,7 @@ env:
   PET_FPS          帧率，默认 8
   PET_NOLABEL=1    不显示底部状态文字
 """
+import math
 import os
 import sys
 import time
@@ -125,8 +126,12 @@ def _state_images(state):
     return rendered
 
 
-def _frame_to_ansi(im, tw, th):
+def _frame_to_ansi(im, tw, th, dim=1.0):
     px = im.convert("RGBA").load()
+
+    def d(c):  # 颜色按 dim 变暗（sleeping 用 dim<1，营造闭眼/沉睡感）
+        return (int(c[0] * dim), int(c[1] * dim), int(c[2] * dim))
+
     lines = []
     for y in range(0, th, 2):
         out = []
@@ -142,19 +147,19 @@ def _frame_to_ansi(im, tw, th):
                 out.append(" ")
                 continue
             if ta and ba:
-                fg = (top[0], top[1], top[2]); bg = (bot[0], bot[1], bot[2])
+                fg = d(top); bg = d(bot)
                 if fg != pfg:
                     out.append(f"\033[38;2;{fg[0]};{fg[1]};{fg[2]}m"); pfg = fg
                 if bg != pbg:
                     out.append(f"\033[48;2;{bg[0]};{bg[1]};{bg[2]}m"); pbg = bg
                 out.append("▀")
             elif ta:
-                fg = (top[0], top[1], top[2])
+                fg = d(top)
                 if fg != pfg or pbg is not None:
                     out.append(f"\033[38;2;{fg[0]};{fg[1]};{fg[2]}m\033[49m"); pfg = fg; pbg = None
                 out.append("▀")
             else:
-                fg = (bot[0], bot[1], bot[2])
+                fg = d(bot)
                 if fg != pfg or pbg is not None:
                     out.append(f"\033[38;2;{fg[0]};{fg[1]};{fg[2]}m\033[49m"); pfg = fg; pbg = None
                 out.append("▄")
@@ -177,6 +182,201 @@ def read_state():
     return s if s in STATE_ROW else "idle"
 
 
+# 各状态的运动参数：(速度, 漫游幅度, 跳跃周期tick, 跳跃高度比例) —— 整体偏慢，避免晃眼
+STATE_MOTION = {
+    "idle":         (0.8, 0.8, 180, 0.22),
+    "thinking":     (0.5, 0.5, 0,   0.0),
+    "working":      (0.8, 0.7, 140, 0.16),
+    "done":         (0.8, 0.8, 90,  0.40),
+    "error":        (1.2, 0.3, 0,   0.0),
+    "notification": (0.8, 0.6, 110, 0.28),
+    "subagent":     (0.9, 0.7, 120, 0.22),
+    "sleeping":     (0.2, 0.1, 0,   0.0),
+}
+
+
+def _motion(tick, room_x, room_y, state):
+    """在窗格空闲区域内算一个生动的位置：漫游(Lissajous)+悬停微抖+周期小跳，按状态调幅度。"""
+    sp, wan, hop_every, hop_r = STATE_MOTION.get(state, (0.8, 0.8, 180, 0.22))
+    t = tick * 0.08 * sp
+    ax = room_x * 0.45 * wan
+    ay = room_y * 0.40 * wan
+    px = room_x / 2 + ax * math.sin(t * 0.9)
+    py = room_y / 2 + ay * math.sin(t * 1.3 + 1.1)
+    py += math.sin(t * 3.1) * min(1.5, room_y * 0.06)          # 悬停微抖
+    px += math.sin(t * 2.6 + 0.6) * min(1.0, room_x * 0.04)
+    if state == "error":                                       # 报错时发抖
+        px += math.sin(t * 9.0) * 1.2
+        py += math.cos(t * 11.0) * 0.8
+    if hop_every and room_y > 2:                               # 周期性小跳
+        c = tick % hop_every
+        if c < 16:
+            py -= math.sin(c / 16 * math.pi) * (room_y * hop_r + 1)
+    px = max(0.0, min(room_x, px))
+    py = max(0.0, min(room_y, py))
+    return int(round(px)), int(round(py))
+
+
+def _snore(tick):
+    """打呼噜：加粗黄色 z/Z，浮动飘起。返回多行列表。"""
+    B = "\033[1;33m"; R = "\033[0m"
+
+    def z(i):
+        return f"{B}{'Z' if (tick // 3 + i) % 2 else 'z'}{R}"
+
+    ind = (tick % 6) + 3
+    return [
+        " " * ind + f"{z(0)}   {z(1)}",
+        " " * (ind + 4) + f"{z(2)}   {z(3)}",
+    ]
+
+
+_FLAME_STOPS = (
+    (0.00, (255, 252, 230)),   # 白黄尖（最热）
+    (0.16, (255, 235, 150)),   # 黄
+    (0.45, (255, 170, 45)),    # 橙身
+    (0.75, (240, 95, 30)),     # 橙红
+    (1.00, (195, 45, 20)),     # 红底
+)
+
+
+def _flame_grad(t):
+    """火焰高度渐变色（尖 0 → 底 1）。"""
+    for i in range(len(_FLAME_STOPS) - 1):
+        t0, c0 = _FLAME_STOPS[i]
+        t1, c1 = _FLAME_STOPS[i + 1]
+        if t <= t1:
+            f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+            return (int(c0[0] + (c1[0] - c0[0]) * f),
+                    int(c0[1] + (c1[1] - c0[1]) * f),
+                    int(c0[2] + (c1[2] - c0[2]) * f))
+    return _FLAME_STOPS[-1][1]
+
+
+def _flame_color(t, core):
+    """最终色 = 高度渐变 + 亮核(中心向白黄靠，呈立体感)。core∈[0,1]，越大越靠中心越亮。"""
+    b = _flame_grad(t)
+    hot = (255, 250, 215)
+    k = core * 0.5                              # 中心增亮（径向，营造立体圆润）
+    r = b[0] + (hot[0] - b[0]) * k
+    g = b[1] + (hot[1] - b[1]) * k
+    bl = b[2] + (hot[2] - b[2]) * k
+    return (max(0, min(255, int(r))), max(0, min(255, int(g))), max(0, min(255, int(bl))))
+
+
+def _vnoise(x, y):
+    """2D 值噪声（确定性、无随机）：整数格点哈希 + smoothstep 双线性插值，返回 [0,1)。
+    驱动火焰边缘锯齿/火舌 与 内部对流条纹。"""
+    xi = int(math.floor(x))
+    yi = int(math.floor(y))
+    xf = x - xi
+    yf = y - yi
+    xf = xf * xf * (3.0 - 2.0 * xf)
+    yf = yf * yf * (3.0 - 2.0 * yf)
+
+    def h(a, b):
+        n = (a * 374761393 + b * 668265263) & 0xFFFFFFFF
+        n = ((n ^ (n >> 13)) * 1274126177) & 0xFFFFFFFF
+        return ((n ^ (n >> 16)) & 0xFFFFFFFF) / 4294967295.0
+
+    a = h(xi, yi); b = h(xi + 1, yi); c = h(xi, yi + 1); d = h(xi + 1, yi + 1)
+    return a * (1 - xf) * (1 - yf) + b * xf * (1 - yf) + c * (1 - xf) * yf + d * xf * yf
+
+
+def _flame_bitmap(tick):
+    """一帧火焰 RGBA：尖头水滴 + 噪声驱动的锯齿/火舌边缘(非圆润) + 内部对流条纹 + 亮核。"""
+    from PIL import Image
+    W, H = 48, 24
+    im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    px = im.load()
+    ph = tick * 0.9
+    lean = 0.12 * math.sin(ph * 1.3)           # 尖端倾
+    cx0 = W / 2 + 0.8 * math.sin(ph * 1.7)     # 整体摆
+    breathe = 1.0 + 0.06 * math.sin(ph * 1.5)  # 呼吸
+    R = (W - 6) / 2.0
+    for y in range(H):
+        t = y / (H - 1)                        # 0 尖 .. 1 底
+        prof = t ** 0.52                        # 渐缩轮廓
+        prof *= (1.0 - 0.12 * t ** 4)          # 底部宽（矮胖火）
+        base_hw = R * prof * breathe
+        if base_hw < 0.2:                      # 尖端过窄，留空（避免除零）
+            continue
+        cx = cx0 + lean * (1.0 - t) * 4.0      # 尖端随 lean 倾，底部不动
+        ny = y * 0.30 + ph * 0.6               # 垂直拉伸 + 随时间上漂（火舌上窜）
+        for x in range(W):
+            d = x + 0.5 - cx
+            # 两层噪声 → 边缘锯齿/火舌（大舌 + 细齿），替代平滑正弦
+            n1 = _vnoise(x * 0.42, ny)              # 主火舌（几个大舌，纵向连贯）
+            n2 = _vnoise(x * 1.7 + 11.3, ny * 2.6 + 5.1)   # 细齿/毛刺
+            amp = 0.55 + 1.05 * (1.0 - t)           # 尖端剧烈破碎，底部相对实
+            jag = ((n1 - 0.5) * 1.05 + (n2 - 0.5) * 0.5) * amp
+            local_hw = base_hw * max(0.06, 1.0 + jag)   # 深谷→火舌间隙；高峰→突出火舌
+            edge = abs(d) / local_hw
+            if edge > 1.0:
+                continue
+            cov = max(0.0, 1.0 - edge ** 2.0)             # 软边覆盖率
+            if cov <= 0:
+                continue
+            # 内部对流条纹：慢变 x 噪声调制核心亮度 → 层次/纹理
+            streak = _vnoise(x * 0.33 + 3.7, y * 0.12 + ph * 0.3)
+            core = max(0.0, 1.0 - edge / 0.5) * (0.55 + 0.45 * streak)
+            col = _flame_color(t, min(1.0, core))
+            a = int(255 * cov)
+            if px[x, y][3] < a:
+                px[x, y] = (col[0], col[1], col[2], a)
+    return im
+
+
+# 2×2 象限块字形：掩码 = TL*8 + TR*4 + BL*2 + BR*1
+_QUAD = {0: " ", 1: "▗", 2: "▖", 3: "▄", 4: "▝", 5: "▐", 6: "▞", 7: "▟",
+         8: "▘", 9: "▚", 10: "▌", 11: "▙", 12: "▀", 13: "▜", 14: "▛", 15: "█"}
+
+
+def _quad_render(im, cw, rh):
+    """2×2 象限块渲染：每格拆 4 子像素，按 alpha 掩码选象限字形，颜色=填充子像素 alpha 加权平均。
+    比半块(▀)分辨率翻倍，边缘曲线平滑，消除低分辨率下的「竹节/阶梯」感。"""
+    from PIL import Image
+    im = im.convert("RGBA").resize((cw * 2, rh * 2), Image.LANCZOS)
+    px = im.load()
+    lines = []
+    for cy in range(rh):
+        out = []
+        prev = None
+        for cx in range(cw):
+            subs = [px[2 * cx, 2 * cy], px[2 * cx + 1, 2 * cy],
+                    px[2 * cx, 2 * cy + 1], px[2 * cx + 1, 2 * cy + 1]]
+            mask = 0
+            rs = gs = bs = w = 0
+            for i, (r, g, b, a) in enumerate(subs):
+                if a > 70:
+                    mask |= (8 >> i)
+                    rs += r * a; gs += g * a; bs += b * a; w += a
+            if mask == 0:
+                if prev is not None:
+                    out.append("\033[0m"); prev = None
+                out.append(" ")
+            else:
+                col = (rs // w, gs // w, bs // w)
+                if col != prev:
+                    out.append(f"\033[38;2;{col[0]};{col[1]};{col[2]}m"); prev = col
+                out.append(_QUAD[mask])
+        out.append("\033[0m")
+        lines.append("".join(out))
+    return lines
+
+
+FLAME_COLS = 12    # 火苗终端宽度（列）
+FLAME_ROWS = 6     # 火苗终端高度（行）—— 象限块渲染，更矮胖
+
+
+def _flame(tick, pet_w):
+    """thinking 时头顶火苗：实心尖头水滴，亮核 + 两侧不规则舔动，象限块平滑渲染。返回多行。"""
+    im = _flame_bitmap(tick)
+    lines = _quad_render(im, FLAME_COLS, FLAME_ROWS)
+    sp = " " * max(0, (pet_w - FLAME_COLS) // 2)
+    return [sp + ln for ln in lines]
+
+
 def render(tick, cols=None, rows=None):
     if cols is None or rows is None:
         sz = shutil.get_terminal_size((80, 24))
@@ -186,14 +386,23 @@ def render(tick, cols=None, rows=None):
     frames = _state_images(s)
     fr = frames[tick % len(frames)]
     w, h = _imgsize[s]
-    pad_h = " " * max(0, (cols - w) // 2)
-    body = [pad_h + ln for ln in fr]
+    block = []
+    if s == "thinking":
+        block.extend(_flame(tick, w))
+    if s == "sleeping":
+        block.extend(_snore(tick))
+    block += list(fr)
     if not os.environ.get("PET_NOLABEL"):
-        label, col = LABEL[s]
-        spin = "·"  # 不用 unicode spinner 避免和图像抢眼
-        body.append(pad_h + f"{spin} \033[2m{label}\033[0m")
-    pad_top = max(0, (rows - len(body)) // 2)
-    return "\n".join([""] * pad_top + body)
+        label = LABEL[s][0]
+        block.append(f"· \033[2m{label}\033[0m")
+    room_x = max(0, cols - w)
+    room_y = max(0, rows - len(block))
+    if room_x == 0 and room_y == 0:
+        px = py = 0
+    else:
+        px, py = _motion(tick, room_x, room_y, s)
+    pad = " " * px
+    return "\n".join([""] * py + [pad + ln for ln in block])
 
 
 def tight_size():
