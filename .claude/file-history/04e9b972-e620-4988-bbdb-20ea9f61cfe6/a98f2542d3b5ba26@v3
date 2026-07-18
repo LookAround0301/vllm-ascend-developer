@@ -1,0 +1,349 @@
+# GLM5.2-W4A8 Prefill KV Cache 初始化与结构（含 indexer 复用）
+
+> 范围：`prefill_kv_offload_lxs.sh` 加载的 canonical clone `vllm-ascend/` @ HEAD `304ba9df0`，
+> 模型 `/mnt/share/GLM-5.2-W4A8-0628/`（`model_type=glm_moe_dsa`）。所有结论带 `file:line`，数值来自 `config.json`。
+> 本文档 = 初始报告 + 三轮补充（W4A8 边界、indexer 双重表示、UniformType 分组）+ 诊断日志方案。
+
+---
+
+## 0. 这条脚本走的是哪条 offload 路径（先厘清，别和 decode 路径混）
+
+`prefill_kv_offload_lxs.sh` 的两个决定性配置（`:63,68-81`）：
+
+```bash
+--quantization ascend                          # w4a8（详见 §8：实际是 int4 weight + bf16 activation）
+--additional-config '{..."enable_sparse_c8": false...}'   # 注意：没有 "use_offload"
+--kv-transfer-config '{"kv_connector": "AscendStoreConnector", "kv_role": "kv_both",
+                       "kv_connector_extra_config": {"backend":"memcache",
+                       "use_layerwise": true, "layerwise_num_shared_buffers":2}}'
+```
+
+由此在 `model_runner_v1.py` 推出两个全局开关：
+
+- `self.use_offload = self.ascend_config.use_offload`（`:392`）→ **`False`**（配置无 `use_offload`）
+- `self.use_sparse = hasattr(hf_text_config,"index_topk") and not hasattr(...,"compress_ratios")`（`:387-391`）→ **`True`**（GLM5.2 有 `index_topk=2048`）
+
+⚠️ 这两点决定后续所有分支。`CLAUDE.md` / 代码 `model_runner_v1.py:5443` 那句 *“pad reused indexer module”* 是 **`use_sparse and use_offload` 分支（decode offload 路径，`decode_kv_offload.sh` + `SFAKVOffloadConnector`）**，不是本脚本。本脚本走 `use_offload=False` 分支，indexer 处理方式完全不同（§3、§5）。
+
+---
+
+## 1. GLM5.2 模型结构（决定 KV cache 形状的基础）
+
+`config.json` 真实数值：
+
+| 字段 | 值 | 含义 |
+|---|---|---|
+| `num_hidden_layers` | **78** | transformer 层数（另有 `num_nextn_predict_layers=1`，1 个 MTP 层） |
+| `num_attention_heads` | 64 | query 头数 |
+| `kv_lora_rank` | **512** | MLA 压缩 latent 维（K/V 的“nope”部分） |
+| `qk_rope_head_dim` | **64** | MLA 解耦 RoPE 维 |
+| `qk_nope_head_dim` / `v_head_dim` | 192 / 256 | attention 时上采抬出，**不进 cache** |
+| `index_head_dim` | **128** | DSA indexer 的 K 维 |
+| `index_topk` | 2048 | sparse 选 top-2048 KV |
+| `index_topk_freq` | 4 | indexer 约每 4 层一次 |
+| `dtype` | bfloat16 | 模型计算 dtype |
+
+**indexer 复用在模型层的根：`indexer_types`**（78 元素列表，值仅 `'full'`/`'shared'`）：
+
+- `'full'` 层 **21 个**，位置 `[0,1,2,6,10,14,18,…,74]`：**拥有 indexer**，自己算并存 indexer K。
+- `'shared'` 层 **57 个**：**复用最近一个 full 层算出的 top-k index**，自己不存 indexer K。
+
+调度公式（`vllm/model_executor/models/deepseek_v2.py:1023-1032`，`index_topk_pattern=null` 走 freq）：
+`_skip_topk = max(layer_id - 2, 0) % 4 != 0`。layer 0,1,2,6,10,… → full；其余 shared。与 `indexer_types` 完全一致。
+
+MLA latent KV 的存储维度（`vllm/model_executor/layers/attention/mla_attention.py:363,367`）：
+`head_size = kv_lora_rank + qk_rope_head_dim = 576`，`num_kv_heads = 1` —— 每个 token 压成 1 个 head、宽 576 的 latent（`kv_c_normed[512]` + `k_pe[64]`）。
+
+---
+
+## 2. KV cache 初始化总流程（调用链）
+
+入口 `AscendModelRunner.initialize_kv_cache`（`model_runner_v1.py:4193`）：
+
+```
+initialize_kv_cache(kv_cache_config)               # :4193
+├─ _merge_kv_cache_tensors_for_layer_reuse()       # :4205  ← AscendStore layerwise 复用合并（§5.2）
+├─ initialize_attn_backend()                       # :4208  ← 建 attn group（跳过 indexer 组, :5386）
+├─ initialize_kv_cache_tensors()                   # :4216
+│   ├─ _allocate_kv_cache_tensors()                # :4279  ← 分配 raw int8，切 2-tuple/3-tuple（§4）
+│   ├─ _reshape_kv_cache_tensors()                 # :4281  ← raw int8 → bf16 最终 shape（§4）
+│   └─ bind_kv_cache()                             # :4304  ← 绑定到 forward context
+└─ get_kv_transfer_group().register_kv_caches(kv_caches)  # :4235  ← 交给 AscendStoreConnector（§6）
+```
+
+`get_kv_cache_spec()`（`:5423`）在更早 profiling 阶段就调过一次，生成每层 `KVCacheSpec`，vLLM 据此算 `kv_cache_groups`/`page_size_bytes`/`num_blocks`，之后才进 `initialize_kv_cache`。流程即 **spec 构造 → vLLM 算尺寸 → 分配 → reshape → 注册 connector**。
+
+---
+
+## 3. `get_kv_cache_spec`：spec 怎么构造（indexer 复用的第一层）
+
+`use_offload=False` → 走 `MLAAttention + use_sparse` 分支（`model_runner_v1.py:5514-5555`）：
+
+```python
+elif isinstance(attn_module, MLAAttention):              # :5514
+    if self.use_sparse:                                  # :5515
+        has_indexer = bool(getattr(impl, "has_indexer", False))   # :5517  ← full 还是 shared
+        ...
+        if has_indexer:                                  # :5535  full 层
+            sparse_head_dim = self.sparse_head_dim       # = (512, 64, 128)
+        else:                                            # :5537  shared 层
+            # Layers that reuse another layer's top-k indices only
+            # need the MLA latent and RoPE caches.
+            sparse_head_dim = (kv_lora_rank, qk_rope_head_dim, 0)  # = (512, 64, 0)
+
+        kv_cache_spec[layer_name] = AscendMLAAttentionSpec(   # :5546
+            block_size=self.block_size, num_kv_heads=1,
+            head_size=sum(sparse_head_dim),   # full=704, shared=576
+            sparse_head_dim=sparse_head_dim, dtype=self.kv_cache_dtype, ...)
+```
+
+要点：
+
+1. **indexer 维被折叠进 MLA 层自己的 spec**（`sparse_head_dim` 第三项），**没有单独的 indexer 层**。`DeepseekV32IndexerCache` 被显式跳过（`:5574-5579`：“on Ascend, the indexer's k_cache is replaced by IndexerWrapper, so its KV cache is unused”）。所以 78 个 `model.layers.N.self_attn.attn` 各一个 spec。
+2. **GLM5.2 所有 78 层都走 `elif has_indexer` 分支 → 全部 `(512,64,128)`、head_size=704、3-tuple**。`else` 分支（`(512,64,0)` 2-tuple）对 GLM5.2 是死代码。详见下面的“⚠️ 重要纠正”。
+
+> 对比：`use_offload=True`（decode 路径，`:5442-5493`）indexer 是**独立 spec** `make_offload_indexer_mla_spec`，且只 layer 0 注册、`deepcopy`“pad”到所有层 —— 这才是“pad reused indexer module”的真实出处。两条路径 indexer 处理完全不同。
+
+### ⚠️ 重要纠正：GLM5.2 的 78 层**全部** 3-tuple（不是“21 个 3-tuple + 57 个 2-tuple”）
+
+`has_indexer` 的传递链（追到底）：
+
+```
+model_runner_v1.py:5517  has_indexer = bool(getattr(impl, "has_indexer", False))
+sfa_v1.py:654            self.has_indexer = self.indexer is not None
+sfa_v1.py:619            self.indexer = kwargs["indexer"]
+mla.py:114 / :87         indexer = mla_modules.indexer
+deepseek_v2.py:1054      MLAModules(..., indexer=self.indexer)
+deepseek_v2.py:1002-1019 if self.is_v32:  self.indexer = Indexer(...)   # 每层都构造，无 skip_topk 守卫
+deepseek_v2.py:999       self.is_v32 = hasattr(config, "index_topk")   # 模型级，所有层 = True
+```
+
+`is_v32` 是**模型级**标志（GLM5.2 有 `index_topk` → True），对所有 78 层一致 → `deepseek_v2.py:1009` 每层都 `new Indexer(...)` → `self.indexer` 永远非 None → **`has_indexer=True` 对所有 78 层成立**。`_skip_topk`（`:1029`）只是个传给 wrapper 的 flag（`:1073`），不会把 shared 层的 `indexer` 置 None。
+
+**结论**：GLM5.2 的 78 层全走分支②，全部 `sparse_head_dim=(512,64,128)`、全部 3-tuple `(k, v, dsa_k)`，全部分配 `dsa_k_cache`（含 57 个 shared 层 —— 它们的 indexer 在 forward 被跳过，`dsa_k` 分了也不写不读，是空耗）。
+
+**那“复用”在哪？不在 KV cache 分配里**。GLM5.2 的 indexer 复用**只在 forward**：全模型一份共享 `topk_indices_buffer[...,2048]`（`deepseek_v2.py:1235`），shared 层 `_skip_topk=True` → `mla.py:168` 的 `if self.indexer and self.is_sparse and not self.skip_topk:` 不成立 → 不调 indexer，沿用上一个 full 层写进 buffer 的 top-2048 下标。本块的 `else` 分支③（2-tuple）**本该是**“复用层不分配 indexer K”的分配侧优化，但它要求 `has_indexer=False` —— 这需要模型按层传 `indexer=None`（把 Indexer 模块真正共享、只在 full 层实例化），是**未来优化 / 其他模型架构**才会触发的，当前 GLM5.2 走不到。
+
+> 推翻前文基于“21×3-tuple + 57×2-tuple”的推论：§7 的“177 变长条目 + stride 2 错位”不成立（实际 78×3=234 均匀、stride 3、无错位）；§9 的 diag 预测 `tpl_lens` 应为 `{3:78}`（或含 MTP 的 `{3:79}`），不是 `{3:21,2:57}`。这条 diag 现在的作用是**证伪/证实**本纠正。
+
+---
+
+## 4. KV cache 的结构（每层最终长什么样）
+
+### 4.1 分配：raw int8 buffer 按 `sparse_kv_cache_ratio` 切分
+
+`_allocate_kv_cache_tensors`（`:4447`）对本场景（`use_sparse and not use_offload`，`:4547`）的每层：vLLM 给的 `kv_cache_tensor.size`（一字节单位整块 raw buffer）按比例切。比例来自 `sparse_kv_cache_ratio`（`vllm_ascend/core/kv_cache_interface.py:292-337`）：
+
+```python
+# 非 C8 分支（:330-337）
+return ( head_size/sparse_head_dim[0],          # k  的 split factor
+         head_size/sparse_head_dim[1],          # v  的 split factor
+         head_size/sparse_head_dim[2] if [2]>0 else None,  # dsa_k
+         None )
+```
+
+- **GLM5.2 所有 78 层（按 §3 纠正，全部 `has_indexer=True`）**：`head_size=704`，ratio `(704/512, 704/64, 704/128)` = `(1.375, 11.0, 5.5)` → 按 **512:64:128** 切 3 段。
+- （`else` 分支的 shared 层本会是 `head_size=576`、`(576/512, 576/64, None)` 切 2 段，但 GLM5.2 走不到。）
+
+分配 2MB 对齐的 raw int8 tensor（`alignment=2MB`，支持 prefill disaggregation 地址对齐），按层类型打包（`:4679-4700`）：
+
+```python
+if has_indexer_cache:        # GLM5.2：78 层全部走这里
+    kv_cache_raw_tensors[layer] = (k_tensor, v_tensor, dsa_k_tensor)     # 3-tuple
+else:                        # 仅当 has_indexer=False（GLM5.2 不触发）
+    kv_cache_raw_tensors[layer] = (k_tensor, v_tensor)                   # 2-tuple
+```
+
+### 4.2 Reshape：raw int8 → bf16 最终 shape
+
+`_reshape_kv_cache_tensors`（`:4762`，MLA 分支 `:5100-5147`）。**按 §3 纠正：GLM5.2 的 78 层全部 3-tuple**（`has_indexer` 对所有层为 True）：
+
+```
+每层 kv_cache = (                                   # full 和 shared 层形状相同
+    k_cache:    [num_blocks, block_size, 1, 512]   bf16   # MLA latent（“nope”）
+    v_cache:    [num_blocks, block_size, 1,  64]   bf16   # MLA 解耦 RoPE
+    dsa_k_cache:[num_blocks, block_size, 1, 128]   bf16   # DSA indexer K（shared 层也分配，但 forward 不写不读 —— 空耗）
+)
+```
+
+- `num_kv_heads=1`：MLA 的 KV 是**压缩 latent**，不是按 head 复制。`k_cache` 存 `kv_lora_rank=512` 的下投影 latent（attention 时上采成 K），`v_cache` 存解耦 RoPE key（64）。命名 k=nope/latent、v=rope 是 MLA 惯例。
+- **78 层全部分配 `dsa_k_cache[...,128]`**。其中 57 个 shared 层的 `dsa_k` 不会被使用（forward 跳过 indexer、复用 top-k index）—— 当前实现的已知空耗；`get_kv_cache_spec` 的 `else` 分支（2-tuple）本可省掉它，但 GLM5.2 走不到（见 §3 纠正）。
+
+> **head_size 576 vs 704 的澄清**：模块自带 `MLAAttention.get_kv_cache_spec`（`mla_attention.py:960`）声明 `head_size=576`（latent 512 + rope 64，**不含 indexer**）。但 `use_sparse=True` 时 model_runner（`:5514-5555`）**不调** 它，自建 `head_size=sum(sparse_head_dim)=704`（512+64+128）。跑起来的是 704。
+
+---
+
+## 5. indexer 复用的两层含义（重点，别混）
+
+### 5.1 模型语义层：`full`/`shared` + `has_indexer`（省 indexer KV）
+
+- 由 `indexer_types` 决定，`get_kv_cache_spec` 通过 `impl.has_indexer` 读出。
+- ⚠️ **（按 §3 纠正）GLM5.2 的 shared 层其实也分配了 `dsa_k_cache`** —— 因为 `has_indexer` 对所有 78 层为 True。复用**没有体现在 KV cache 分配上**；它只发生在 forward（见下条）。`get_kv_cache_spec` 的 `else` 分支（不分配 dsa_k）才是“分配侧复用”，但 GLM5.2 走不到。
+- forward 层的精确机制（`deepseek_v2.py:1232-1242, 1023-1032`；`vllm/model_executor/layers/mla.py:91-99,168-169`）：全模型**只分配一次**共享 `topk_indices_buffer[max_num_batched_tokens, 2048]` int32，透传每层；shared 层 `_skip_topk=True` 时 `if self.indexer and self.is_sparse and not self.skip_topk:` 不成立 → 不调 indexer，沿用 buffer 里上一次的 top-2048 下标。
+- **复用的是“索引输出”那个共享 buffer，不是 indexer 模块、也不是 K cache**。每层 indexer 模块和它的 k_cache 仍是独立实例（见下）。
+
+### 5.2 AscendStore buffer 复用层：`use_layerwise` + class-aware（省 HBM buffer + 换到 DRAM）
+
+`use_layerwise=true, layerwise_num_shared_buffers=2` 带来的、与 5.1 完全不同的“复用”。逻辑在 `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise_config.py`：
+
+- `num_shared_buffers=2`，`independent_layers` 默认 `[0, 77]`（首尾各占独立 buffer，`:86`）。
+- 中间 76 个 reused 层**按 nsb=2 轮转**分时复用 2 个 HBM buffer：`reused_layers[k]` 与 `reused_layers[k+2]` 共享一个物理 buffer（`get_layerwise_storage_indices`, `:160-181`）。
+- **class-aware 分区**（`get_layerwise_layout_class_grouping`, `:184-243`）：按 `(spec_type, c8, has_indexer)` 算 layout class key，**只在同 class 内 round-robin**，避免不同 tuple-layout 的层共享一个 buffer 崩 `_reshape`（`model_runner_v1.py:4139-4143` 注释）。**注**：GLM5.2 所有层 has_indexer=True、同 3-tuple → 实际只有一个 layout class（加上 MTP 若不同则两个），class-aware 退化为单 class round-robin。
+- 物理 buffer 数 ≈ `len(independent) + num_classes × nsb`。GLM5.2 单 class（+MTP）≈ `2 + 1×2` = **4**（`get_layerwise_kv_cache_num_tensors`, `:142-157`）。
+- **reuse-mate map**：`prefetch_map[layer_j] = layer_{j-nsb}`（`:240-241`）—— layer j 复用某 buffer 前须等“前任” layer j-2 把 KV 存进 DRAM（save 完成）。写回 `kv_transfer_config._layerwise_reuse_mate_map`（`:4165`），供 load 路径 prefetch 同步。
+
+> 一句话区分：5.1 是“哪些层**有** indexer KV”，5.2 是“N 层**轮转共享**几个 HBM buffer 并换页到 DRAM”。5.1 的 `has_indexer` 同时是 5.2 layout class key 的一部分，两者在此交汇。
+
+---
+
+## 6. 与 AscendStore 的衔接（KV 怎么进 DRAM pool）
+
+`register_kv_caches(kv_caches)`（`model_runner_v1.py:4235`）把分配好的 `kv_caches` 交给 `AscendStoreConnector`（store 侧结论）：
+
+- **`use_gva_layerwise = use_layerwise and backend=="memcache"`**（`ascend_store_connector.py:89`）→ 本配置命中 **GVA 路径**。GVA = **Global Virtual Address**，memfabric/memcache DRAM pool 的全局虚拟地址，区别于按 key 寻址的 put/get。
+- `KVPoolWorker.register_kv_caches`（`pool_worker.py:580-708`）三步：① `m_store.init_store()` boot 每 rank 的 memcache `DistributedObjectStore`（DRAM pool）；② `register_buffer` 注册 HBM buffer；③ `_start_kv_transfer_threads` 起一对 GVA 线程（`KVCacheStoreLayerSendingThread`+`KVCacheStoreLayerRecvingThread`）。
+- **save 路径不用 `torch.to('cpu')`** —— 调 `store.batch_copy(gvas, addrs, sizes, direction=COPY_L2G)`（`kv_transfer.py:1204-1253`，copy `:1231-1238`），按 GVA 地址把 HBM KV 批量搬到 DRAM pool。每个 full block 主动（eagerly）存进 GVA + 以 `block_hash` 为 key 进 prefix-cache。
+- DRAM pool 的 GVA 是 scheduler 侧按 `block_hash` 用 `batch_alloc` 现申请的（`pool_scheduler.py:227-268`），`keys_per_block_hash = num_ranks_per_layer × num_layers`。
+
+> 注意：`CLAUDE.md` 里“save path still uses torch `.to('cpu')`”是 **SFA decode offload** 路径，不是本 AscendStore GVA prefill 路径。
+
+---
+
+## 7. 分组：`UniformTypeKVCacheSpecs` 怎么合并 full/shared（核心，§9 的根因）
+
+**问题**：21 个 full 层 `head_size=704`、57 个 shared 层 `head_size=576`，`page_size_bytes` 不同。它们落进 1 个还是 2 个 pool group？AscendStore layerwise 又要求 `num_kv_cache_groups==1`（`pool_worker.py:181-182`）。这一节给出代码层面的判定。
+
+### 7.1 Ascend 的分组补丁对 GLM5.2 不生效
+
+`vllm_ascend/patch/platform/patch_kv_cache_utils.py` 替换了上游 `group_and_unify_kv_cache_specs` 等（`:253`）。但其入口（`:63-71`）：
+
+```python
+def group_and_unify_kv_cache_specs(kv_cache_spec):
+    if not any(isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()):
+        return None        # ← GLM5.2 无 SWA，直接返回 None
+```
+
+GLM5.2 全是 MLA（无 `SlidingWindowMLASpec`），所以 **Ascend 补丁返回 None，分组回落到上游 vLLM 逻辑**。补丁里 `_get_kv_cache_groups_uniform_groups`（`:97`）/`_get_kv_cache_config_deepseek_v4`（`:189`）都是 DeepseekV4（SWA+MLA 混合）专用，对本场景不适用。
+
+### 7.2 上游 `is_uniform_type` 只比类型，不比 page_size
+
+`UniformTypeKVCacheSpecs.is_uniform_type`（`vllm/v1/kv_cache_interface.py:743-755`）：block_size 一致 → `first_spec.is_uniform_with_collection(all)`。而 `is_uniform_with_collection` 的**基类实现**（`:143-156`）：
+
+```python
+uniform_type_base_spec = KVCacheSpecRegistry.get_uniform_type_base_spec(self)  # MLA → FullAttentionSpec
+return all(isinstance(spec, uniform_type_base_spec) for spec in kv_cache_specs.values())
+```
+
+**只比类型（`isinstance(..., FullAttentionSpec)`），不比 head_size / page_size。** `MLAAttentionSpec`（`:353`）**没有**覆盖它（521/597/638 的 override 分别是 SlidingWindowMLA / Mamba / EncoderOnly）。`AscendMLAAttentionSpec`（`vllm_ascend/core/kv_cache_interface.py:218`）注册的 `uniform_type_base_spec=FullAttentionSpec`。
+
+### 7.3 推论（GLM5.2 实际情况，待 §9 日志确认）
+
+full 和 shared 都是 `AscendMLAAttentionSpec`（→ `FullAttentionSpec`）、同 block_size、**且（按 §3 纠正）全部 3-tuple / head_size=704 / page_size 相同** → **`is_uniform_type=True` → 78 层合成同一个 `UniformTypeKVCacheSpecs` → 1 个 kv_cache_group**，满足 `num_kv_cache_groups==1` 断言。
+
+### 7.4 ❌ 撤销：原“变长 tuple 错位 bug”推论对 GLM5.2 不成立
+
+> 本节原先假设“21 个 3-tuple + 57 个 2-tuple = 177 个变长条目”，推出 `caches_per_layer=177//78=2` 的错位。该假设已被 §3 纠正推翻：GLM5.2 的 78 层**全部 3-tuple**（`has_indexer` 对所有层为 True），所以 flat 布局是 **78×3 = 234 个均匀条目**，`caches_per_layer = 234//78 = 3`，固定 stride 3 对每层都对齐，**没有错位**。
+
+`_infer_cache_group_metadata`（`pool_worker.py:563-578`）按 layer 顺序平铺、`LayerBatchBuilder`（`kv_transfer.py:69-73`）用固定 stride 切片这套机制本身**没问题**——前提是组内 tuple 长度均匀。GLM5.2 满足这个前提。
+
+> 那 HEAD `304ba9df0` 的 diag 探针在查什么？它是个**通用结构探针**（commit msg: `probe ascend_store group/spec/tuple structure`），打印 `tpl_lens`/group/page_size 来 sanity-check。对 GLM5.2 大概率会打印一个“健康”的 `{3:78}` 单组结构。**只有当它真的打出 `{3:21, 2:57}` 这种混合分布时，才说明存在我没看到的 per-layer `indexer=None` 路径** —— 那才是新线索。所以 §9 那条日志现在是用来**证伪/证实本纠正**的。
+
+---
+
+## 8. W4A8 量化的边界（不碰 KV cache，但名字有误导）
+
+`--quantization ascend` → `AscendModelSlimConfig`（`vllm_ascend/quantization/modelslim_config.py:508`）读 `quant_model_description.json`，按层查到 `quant_type="W4A8_DYNAMIC"`（`vllm_ascend/quantization/methods/w4a8.py:38`）。但 `apply` 实际行为（`w4a8.py:185-191`）：
+
+```python
+def apply(self, layer, x, bias=None, tp_rank=None):
+    # NOTE: activation `x` is not quantized
+    return torch_npu.npu_weight_quant_batchmatmul(
+        x, layer.weight, antiquant_scale=..., antiquant_group_size=self.group_size)
+```
+
+**weight int4，activation 不量化（用原始 bf16 在线反量化做 matmul）** —— 名字叫 A8，runtime 实际是 W4A16。`QuantType.W4A8`（`quant_type.py:31`）只是逻辑标签。只作用于 Linear/MoE 的 matmul，**完全不碰 KV cache 的 dtype/形状**。KV cache dtype = `cache_config.cache_dtype` = `"auto"` → bf16。
+
+> 结论：学习 KV cache 时可把 w4a8 当作“与 KV cache 正交”的 weight 量化，不必纠结它对 cache 的影响。
+
+---
+
+## 9. 当前 HEAD 的活跃调查 + 诊断日志方案
+
+HEAD `304ba9df0` 是个 **diag 探针**，在查 §7.4 那个“177 个变长 cache 条目 + 固定 stride 2”的错位。现有探针在 `pool_worker.py:585-619`，已会打印一条日志。下面给“抓现有日志 + 补 3 条精准日志”的方案，跑完把日志贴回来即可定位。
+
+### 9.1 先抓现有 diag（无需改代码）
+
+跑 `prefill_kv_offload_lxs.sh` 后：
+
+```bash
+grep -E "AscendStore diag:|num_blocks:" online_1.log
+```
+
+它会输出（`pool_worker.py:610`）：
+`AscendStore diag: kv_caches=N layers, tpl_lens={...}, kv_cache_groups=1 [<AscendMLAAttentionSpec n_layers=78 page_size_bytes=...>]`
+
+→ **预测（按 §3 纠正）：`tpl_lens` 应为 `{3: 78}`（或含 MTP 的 `{3:79}`/多一种长度）**。若实测是 `{3:21, 2:57}` 这种 2/3 混合，说明存在我没追到的 per-layer `indexer=None` 路径 —— 重要新线索，务必贴回来。
+
+### 9.2 补 3 条精准日志（证伪/证实 §3 纠正 + 看 stride）
+
+**(a) flat 布局探针** —— `_infer_cache_group_metadata` 末尾（`pool_worker.py:578` 后）加：
+
+```python
+logger.info("AscendStore diag[meta]: group_id=%d flat_entries=%d num_layers=%d "
+            "per_layer_tpl_first10=[%s]",
+            group_id, len(group_addrs), len(layer_names),
+            ",".join(str(len(self._as_cache_tuple(self.kv_caches[n])))
+                     for n in layer_names[:10]))
+```
+→ 看 flat_entries 是 **234（78×3 均匀，符合 §3 纠正）** 还是 **177（2/3 混合，纠正错了）**。
+
+**(b) stride 探针** —— `LayerBatchBuilder.__init__`（`kv_transfer.py:73` 后）加：
+
+```python
+logger.info("AscendStore diag[lbb]: block_len_np.len=%d num_layers=%d "
+            "caches_per_layer=%d flat//layers=%d block_len_first12=%s",
+            self._block_len_np.shape[0], num_layers, self._caches_per_layer,
+            self._block_len_np.shape[0] // max(1, num_layers),
+            self._block_len_np.tolist()[:12])
+```
+→ 看 `caches_per_layer` 是否 = **3（均匀，符合 §3 纠正）**；block_len 序列是否一致。
+
+**(c) 逐层窗口探针** —— `_build_transfer_arrays`（`kv_transfer.py:117` 后）加：
+
+```python
+if layer_id < 6:
+    logger.info("AscendStore diag[build]: layer_id=%d caches_per_layer=%d "
+                "base_offset=%d window=%d layer_block_len=%s",
+                layer_id, caches_per_layer, base_offset, len(layer_base_addrs),
+                layer_block_len.tolist())
+```
+→ 看 layer 0/1/2（full，应 3 项）是否只切到 2 项、base_offset 是否对不上真实边界。
+
+跑完把 `grep "AscendStore diag" online_1.log` 的输出贴回来，即可判定：① 是否真一组；② flat 是否变长 177；③ stride 是否错位；④ indexer KV（dsa_k）在 pool 里是否被正确寻址。
+
+---
+
+## 附：关键代码位置速查
+
+| 主题 | 位置 |
+|---|---|
+| `use_sparse`/`use_offload` 判定 | `model_runner_v1.py:387-392` |
+| `sparse_head_dim` 设置 | `model_runner_v1.py:407-411` |
+| 初始化主流程 | `model_runner_v1.py:4193-4235` |
+| `get_kv_cache_spec`（MLA+use_sparse 分支） | `model_runner_v1.py:5514-5555` |
+| `DeepseekV32IndexerCache` 被跳过 | `model_runner_v1.py:5574-5579` |
+| 分配：2-tuple/3-tuple 切分 | `model_runner_v1.py:4547-4700` |
+| reshape：最终 shape | `model_runner_v1.py:5100-5147` |
+| `sparse_kv_cache_ratio` | `vllm_ascend/core/kv_cache_interface.py:292-337` |
+| `sparse_kv_cache_has_indexer` | `vllm_ascend/utils.py:1722-1724` |
+| layerwise class-aware 复用 | `ascend_store/layerwise_config.py:184-243` |
+| AscendStore `num_kv_cache_groups==1` 断言 | `ascend_store/pool_worker.py:181-182` |
+| `register_kv_caches`（boot GVA pool） | `ascend_store/pool_worker.py:580-708` |
+| diag 探针（main/indexer 同组） | `ascend_store/pool_worker.py:585-619` |
+| `_infer_cache_group_metadata`（flat 177 布局） | `ascend_store/pool_worker.py:563-578` |
+| `LayerBatchBuilder` 固定 stride | `ascend_store/kv_transfer.py:49-73, 106-119` |
+| GVA save：`batch_copy` L2G | `ascend_store/kv_transfer.py:1204-1253` |
+| Ascend 分组补丁（对 GLM5.2 返回 None） | `vllm_ascend/patch/platform/patch_kv_cache_utils.py:63-71` |
+| 上游 `is_uniform_type` / `is_uniform_with_collection` | `vllm/v1/kv_cache_interface.py:143-156, 743-755` |
+| W4A8 `apply`（activation 不量化） | `vllm_ascend/quantization/methods/w4a8.py:185-191` |
+| 共享 `topk_indices_buffer` + `skip_topk` | `vllm/model_executor/models/deepseek_v2.py:1232-1242, 1023-1032` |

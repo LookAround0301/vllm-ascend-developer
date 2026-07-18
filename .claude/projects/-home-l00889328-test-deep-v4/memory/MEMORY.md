@@ -1,0 +1,1 @@
+- [GLM-5 MTP3+flashcomm Fix](mtp-flashcomm-fix.md) — Root cause: norm inflation + stale data + rank identity loss after gather. Two fixes applied, core data-flow issue unresolved.

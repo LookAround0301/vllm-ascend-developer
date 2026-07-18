@@ -1,0 +1,136 @@
+# ============================================================================
+# service.yaml — vLLM 服务配置
+# ============================================================================
+# 使用前请根据实际环境修改对应字段
+#
+# ===== 模式说明 =====
+#   mode: 部署模式
+#     - "standalone"    单机模式，prefill 与 decode 混合调度
+#     - "pd-separated"  PD分离模式，P节点（prefill）与 D节点（decode）分离调度
+#
+# ===== 节点字段说明（standalone / p_nodes / d_nodes 共用） =====
+#   host:           服务器 IP 地址
+#   port:           SSH 端口，默认 22
+#   username:       SSH 用户名
+#   password:       SSH 密码
+#   work_dir:       宿主机工作目录（存放脚本或源码）
+#   service_port:   服务端口
+#   env_vars:       环境变量
+#     ASCEND_RT_VISIBLE_DEVICES:  可见的 Ascend 设备编号，逗号分隔, 例： export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+#   docker:         容器配置（可选，覆盖全局 docker 默认值）
+#
+# ===== Docker 字段说明 =====
+#   name:            容器名称
+#   work_dir:        容器内工作目录
+#   startup_script:  vLLM 服务启动脚本路径
+#   proxy_script:    proxy 启动脚本路径
+#                    - standalone: 可选，分布式 DP 场景必配
+#                    - pd-separated: 必配
+#   proxy_port:      proxy 监听端口，配了就按此端口杀 proxy
+#   log_file:        容器内服务日志路径
+#
+# ===== 通用服务字段说明 =====
+#   startup_timeout:   启动超时时间（秒）
+#   success_keywords:  服务启动成功的关键词列表，用于健康检查
+#
+# ===== 合并优先级 =====
+#   节点级 docker > 全局 docker 默认值
+# ============================================================================
+
+# service.yaml
+# vLLM 服务配置
+# 使用前请根据实际环境修改对应字段
+
+mode: "standalone"  # "standalone" | "pd-separated"
+# standalone: 单机模式，prefill 与 decode 混合调度
+# pd-separated: PD分离模式，P节点（prefill）与 D节点（decode）分离调度
+
+# Docker 默认配置（standalone 和 p_nodes 共用，各节点可按需覆盖）
+docker:
+  name: "vllm-ascend-dev"                                            # 容器名称
+  work_dir: "/home/user/workspace"                                  # 容器内工作目录
+  startup_script: "/home/user/vllm-ascend/examples/test.sh"         # 启动脚本路径
+  proxy_script: ""                                                     # proxy 启动脚本路径（standalone可选，PD分离必配）
+  proxy_port: ""                                                       # proxy 监听端口（配置后按此端口杀 proxy）
+  log_file: "/home/user/workspace/service.log"                       # 容器内日志路径
+
+# 单机模式配置（prefill 与 decode 混合调度）
+standalone:
+  host: "<your-server-ip>"                                          # 服务器 IP
+  port: 22                                                            # SSH 端口
+  username: "root"                                                    # SSH 用户名
+  password: "<your-password>"                                       # SSH 密码
+  work_dir: "/path/to/scripts"                                       # 宿主机脚本目录
+  service_port: 8080                                                   # 服务端口
+  env_vars:
+    ASCEND_RT_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+  docker:                                                             # 容器配置（覆盖全局默认值）
+    name: "vllm-ascend-dev"
+    work_dir: "/home/user/workspace"
+    startup_script: "/home/user/vllm-ascend/examples/test.sh"
+    proxy_script: ""                                                 # proxy 启动脚本路径（可选，分布式DP场景必配）
+    log_file: "/home/user/workspace/service.log"
+
+# PD分离模式配置（P节点执行 prefill，D节点执行 decode）
+pd-separated:
+  service_port: 8000                                                   # 服务端口
+  p_nodes:                                                            # Prefill 节点列表
+    - host: "<p-node-ip-1>"                                           # P节点1
+      port: 22
+      username: "root"
+      password: "<your-password>"
+      work_dir: "/path/to/scripts"
+      env_vars:
+        ASCEND_RT_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+      docker:                                                         # 容器配置（覆盖全局默认值）
+        name: "vllm-ascend-dev"
+        work_dir: "/home/user/workspace"
+        startup_script: "/home/user/vllm-ascend/scripts/start_server.sh"
+        proxy_script: "/path/to/proxy/start_proxy.sh"                # proxy 启动脚本路径（PD分离必配）
+        log_file: "/home/user/workspace/service.log"
+    - host: "<p-node-ip-2>"                                           # P节点2
+      port: 22
+      username: "root"
+      password: "<your-password>"
+      work_dir: "/path/to/scripts"
+      env_vars:
+        ASCEND_RT_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+      docker:                                                         # 容器配置（覆盖全局默认值）
+        name: "vllm-ascend-dev"
+        work_dir: "/home/user/workspace"
+        startup_script: "/home/user/vllm-ascend/scripts/start_server.sh"
+        proxy_script: "/path/to/proxy/start_proxy.sh"                # proxy 启动脚本路径（PD分离必配）
+        log_file: "/home/user/workspace/service.log"
+  d_nodes:                                                            # Decode 节点列表
+    - host: "<d-node-ip-1>"                                           # D节点1
+      port: 22
+      username: "root"
+      password: "<your-password>"
+      work_dir: "/path/to/vllm-ascend"
+      env_vars:
+        ASCEND_RT_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+      docker:                                                         # 容器配置（覆盖全局默认值）
+        name: "vllm-ascend-dev"
+        work_dir: "/home/user/workspace"
+        startup_script: "/home/user/vllm-ascend/scripts/start_server.sh"
+        proxy_script: "/path/to/proxy/start_proxy.sh"                # proxy 启动脚本路径（PD分离必配）
+        log_file: "/home/user/workspace/service.log"
+    - host: "<d-node-ip-2>"                                           # D节点2
+      port: 22
+      username: "root"
+      password: "<your-password>"
+      work_dir: "/path/to/vllm-ascend"
+      env_vars:
+        ASCEND_RT_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+      docker:                                                         # 容器配置（覆盖全局默认值）
+        name: "vllm-ascend-dev"
+        work_dir: "/home/user/workspace"
+        startup_script: "/home/user/vllm-ascend/scripts/start_server.sh"
+        proxy_script: "/path/to/proxy/start_proxy.sh"                # proxy 启动脚本路径（PD分离必配）
+        log_file: "/home/user/workspace/service.log"
+
+# 通用服务配置
+startup_timeout: 480                                                  # 启动超时（秒）
+success_keywords:
+  - "Application startup complete."
+  - "Started server process"

@@ -1,0 +1,2 @@
+# 由 clawd-term/Claude Code 建议添加：开启 focus-events，供应用做聚焦追踪
+set -g focus-events on

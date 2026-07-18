@@ -1,0 +1,214 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this workspace is
+
+`/home/l00889328/offload` is **not a single repository** — it is a workspace that
+checks out several independent git repositories side by side. There is no top-level
+`.git`; every subdirectory below is its own repo with its own remote, build system,
+and contribution rules.
+
+**Always `cd` into the relevant subproject before running `git`, build, or test
+commands** — `git status` at the workspace root fails.
+
+The subprojects form a layered stack for large-model inference on Ascend NPUs, plus
+a tooling layer that develops and debugs that stack. Dependencies point upward
+(lowest layer at the bottom):
+
+```
+vllm                      ← upstream inference engine (Python) — read-only reference here
+  ▲ plugged into by
+vllm-ascend               ← Ascend NPU hardware plugin (Python + csrc/)
+  ▲ optionally uses as KV-pool backend
+memcache                  ← distributed KV-cache engine (C++/Python)
+  ▲ built on
+memfabric_hybrid          ← DRAM/HBM pooling + cross-machine memory transport (C++)
+
+vllm-ascend-developer     ← side tooling, not part of the runtime stack:
+                             a Claude Code Skill (precision diagnosis, service lifecycle,
+                             automated testing, auto-fix) + HyperScript installer.
+                             Operates on (vllm + vllm-ascend) over SSH.
+```
+
+- **`vllm/`** — upstream vLLM. Treated as read-only here.
+- **`vllm-ascend/`** — the Ascend NPU *hardware plugin* for upstream vLLM. Integrates
+  via vLLM's pluggable hardware interface; it does **not** add model files — it
+  *patches/extends* upstream (see its AGENTS.md). This is where Ascend inference work happens.
+- **`memcache/`** — high-performance distributed KV-cache engine, usable as a
+  `vllm-ascend` KV-pool backend. Vendors MemFabric under `3rdparty/memfabric_hybrid/`.
+- **`memfabric_hybrid/`** — MemFabric: the pooling/direct-access transport layer `memcache` is built on.
+- **`vllm-ascend-developer/`** — a Claude Code Skill + `HyperScript/` installer, not an app.
+- **`claude_code_env/`** — the Claude Code runtime (bundled Node.js), not a project. Ignore
+  unless debugging the harness itself.
+
+## Per-subproject orientation
+
+Each subproject has its own detailed guide — read it before working in that tree.
+
+| Subproject | Lang / build | Its own guide | Read it for |
+|---|---|---|---|
+| `vllm/` | Python, `uv` + CMake | `vllm/CLAUDE.md` → `vllm/AGENTS.md` | Strict contribution policy, `uv`-only workflow, never system python/pip |
+| `vllm-ascend/` | Python, pip + CMake (`csrc/`) | `vllm-ascend/CLAUDE.md` → `vllm-ascend/AGENTS.md` | Patch-over-monkeypatch architecture, `envs.py` centralization, NPU perf rules (`tensor.item()` sync), commit/PR format |
+| `memcache/` | C++/Python, CMake | `memcache/README.md` (+ `doc/`) | MetaService/LocalService architecture, install & API docs |
+| `memfabric_hybrid/` | C++ (CMake/Bazel), pybind | `memfabric_hybrid/CLAUDE.md` (= `AGENTS.md`) | Build/test wrappers, enforced code standards (≤50-line fns, ≤4 nesting, mandatory ERROR logs on failure paths, ≤120 cols), module boundaries |
+| `vllm-ascend-developer/` | Markdown Skill + Python glue + shell | `vllm-ascend-developer/vllm-ascend-developer/CLAUDE.md` + `SKILL.md` | Precision-diagnosis loop, `ssh_utils.py` as the only remote path, only-edit-vllm-ascend invariant |
+
+## Parallel / variant checkouts (read before editing any `vllm-ascend*`)
+
+The layered-stack diagram above shows *one* `vllm-ascend/` and *one* `memfabric_hybrid/`.
+The workspace on disk actually holds **several sibling clones**, each its own git repo on a
+different fork/branch tracking a different offload experiment. They are **not interchangeable**.
+The launch scripts select which clone runs via their `PYTHONPATH=` line — so that line, not the
+directory name, is the source of truth for "which checkout is live". Editing the wrong clone is
+the single biggest time-sink here; confirm the target first.
+
+`vllm-ascend*` clones (each `git remote`/branch differs):
+
+| Clone | Branch | Fork | Notes |
+|---|---|---|---|
+| `vllm-ascend/` | `feat/sfa-offload-rebase-on-main` | gjc0824 | **canonical / active** — the one the rest of this doc refers to |
+| `vllm-ascend-pd/` | `feat/sfa-offload-rebase-on-main` | gjc0824 | currently a **byte-identical mirror of canonical** (same commit `304ba9df0`; only `.pyc` caches differ) — target of `pd_mix_offload.sh`. Was the PD-mix KV-offload line. |
+| `vllm-ascend-buffer/` | `offload` | Angazenn | buffer-pool offload line |
+| `vllm-ascend-poffload_for_d/` | `pd_mix` | ader47 | D-side poffload experiment |
+| `vllm-ascend-tail_block_offload/` | `feat/sfa-offload-layerwise-reuse` | ader47 | SFA tail-block offload experiment |
+
+`memfabric_hybrid*` clones:
+
+| Clone | State | Notes |
+|---|---|---|
+| `memfabric_hybrid/` | detached `HEAD` (`8f474637`) | **canonical** — referenced elsewhere in this doc |
+| `memfabric-hybrid_kvoffload/` | `release_kv_v4` | parallel KV-offload fork (hyphen, not underscore — don't confuse with the canonical one) |
+
+⚠️ Stale `PYTHONPATH` in `prefill_kv_offload.sh` (as of this writing): it points at
+`…/vllm-ascend-pd_mix`, which **does not exist** (the clone was renamed to `vllm-ascend-pd`).
+It will not load the intended clone until corrected — use `prefill_kv_offload_lxs.sh` for the
+prefill path (it targets canonical `vllm-ascend/`). `pd_mix_offload.sh` was already fixed to
+point at `vllm-ascend-pd`. In all cases, verify the `PYTHONPATH=` line resolves before trusting
+what a run exercised.
+
+## Essential commands (quick reference — detail in each guide)
+
+### vllm (upstream)
+```bash
+cd vllm
+uv venv --python 3.12 && source .venv/bin/activate
+VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto   # Python-only changes
+uv pip install -e . --torch-backend=auto                          # changes touch C/C++
+.venv/bin/python -m pytest tests/path/to/test.py -v               # one test file
+pre-commit run                                                    # lint staged files
+```
+Never use system `python3` or bare `pip`. Python line length is **88**.
+
+### vllm-ascend (Ascend plugin)
+```bash
+cd vllm-ascend
+pip install -e .[dev]
+pytest -sv tests/ut/ops/test_prepare_finalize.py::test_prepare_inputs   # single test
+ruff check vllm_ascend/ && ruff format vllm_ascend/
+bash format.sh ci                       # REQUIRED before push — all file types incl. markdown
+git commit -s -m "feat(npu): ..."        # Conventional Commits + sign-off mandatory
+```
+All env vars must be added to the central `vllm_ascend/envs.py` `env_variables` dict, never hardcoded.
+
+### memfabric_hybrid / memcache (C++)
+```bash
+cd memfabric_hybrid        # memcache shares the same script layout
+git submodule update --recursive --init     # first time — gtest/mockcpp; memcache also pulls memfabric
+bash script/build_and_pack_run.sh                       # default RELEASE build
+bash script/run_ut.sh                                   # all UT (clean ASAN + coverage)
+bash script/run_ut.sh --fast                            # incremental, no coverage
+bash script/run_ut.sh --fast TestName                   # single test (gtest_filter)
+TARGET_BRANCH=develop bash script/ci-pre-commit-pr.sh   # CI pre-commit check
+```
+C++ style: clang-format v18.1.8, Allman braces, **column limit 120**. Python (pybind) targets py310, line length 120. Both repos are Mulan PSL v2 and enforce strict code standards — see `memfabric_hybrid/CLAUDE.md`.
+
+### vllm-ascend-developer (Skill)
+A Skill driven by Claude Code, not a built app. From its folder:
+```bash
+pip install paramiko pyyaml
+python scripts/generate_curl.py                 # render test.yaml → curl_test.sh (never hand-edit)
+python scripts/ssh_utils.py exec <node> "<cmd>" # sole remote-exec path; each exec is independent
+```
+In this environment it is registered as the `vllm-ascend-developer` Skill — invoke it for vllm/vllm-ascend dev & precision-debugging workflows.
+
+## Local launch scripts (workspace root)
+
+The workspace root (not part of any git repo) holds the actual commands used to run
+the offload stack on a single NPU node. Each sets `PYTHONPATH` to `vllm/` plus **one of
+the `vllm-ascend*` clones** (see the table above) and `vllm serve`s GLM-5.2-Provide-0610-W4A8.
+
+- `prefill_kv_offload.sh` — prefill-side offload via **`AscendStoreConnector`** with
+  `backend=memcache`, `use_layerwise=true`, `layerwise_num_shared_buffers=2`. Sources
+  `memcache_hybrid`/`memfabric_hybrid` env, starts `mmc_meta_service`, reads
+  `memcache_config/mmc-{meta,local}.conf`. Layer-reuse swap of KV to a memcache DRAM
+  pool (GVA) + prefix-cache keyed by block hash (`AscendStoreConnector`/`KVPoolWorker`
+  under `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/`). ⚠️ Its `PYTHONPATH`
+  is stale (warning above) — use `prefill_kv_offload_lxs.sh` for a working prefill run.
+- `decode_kv_offload.sh` — decode-side offload via **`SFAKVOffloadConnector`** with
+  `use_offload=true` + `lru_resident_cache_config` (single-node HBM↔CPU paging, DSA
+  sparse attention — see the SFA section below).
+- `pd_mix_offload.sh` — PD-mix offload variant (`ASCEND_BUFFER_POOL=4:8`; sources
+  `/usr/local/memcache_hybrid/set_env.sh` + `/usr/local/memfabric_hybrid/set_env.sh`; uses a
+  `MultiConnector` wrapping `AscendStoreConnector`). Targets `vllm-ascend-pd/`.
+- `prefill_kv_offload_lxs.sh` — `_lxs` (author-initials) variant of the prefill script, and the
+  **working** one: it targets the canonical `vllm-ascend/`, whereas `prefill_kv_offload.sh`'s
+  `PYTHONPATH` is stale (above). Both scripts set `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` — the
+  meaningful diff is the clone target, not the flag.
+- Driving a running server: `curl.sh` POSTs `@data2.json` to `localhost:8004/v1/completions`
+  (model `glm-5`; `data.json` is an older/smaller payload).
+- `memcache_config/` — memcache MetaService/LocalService configs (`device_sdma`, DRAM pool).
+
+## Subsystem focus: KV offload in vllm-ascend (SFA)
+
+A major multi-file architecture **not** covered by `vllm-ascend/AGENTS.md`. **SFA = Sparse Flash Attention** (DeepSeek-style MLA + top-k sparse KV selection). The offload subsystem pages KV between NPU HBM and a CPU pinned pool so long contexts fit when HBM is full. MLA models only (GLM5.x, DeepSeek-V3.2 — both MLA + a `DeepseekV32IndexerCache` indexer); standard-attention models do not use this path.
+
+Two layered connectors under `vllm_ascend/distributed/kv_transfer/`, both registered in `__init__.py`:
+
+- **`sfa_kv_offload/`** — *single-node base*. Every full main-MLA block is offloaded HBM→CPU on a side NPU stream (`SFAKVOffloadWorker.start_load_kv`→`process_layer_data`→`save_cpu`, copy in `kv_transfer.py`'s `KVCacheStoreLayerSendingThread`). The **indexer group and the partial last block stay in HBM** (decode appends to the partial). Decode loads top-k back via `prepare_lru_resident_and_load` + `cpu_sparse_attn.cpp` (**address translation only — no attention math on CPU**; the misnomer is legacy) + `memfabric_hybrid.offload.sparse_copy` (the load-back primitive; was `zbal.batch_copy`). The save path still uses torch `.to('cpu')`; `offload.initialize(tp_rank, 64 GB)` boots the per-rank memfabric DRAM pool. Offload policy is fully eager (every full block); what stays in HBM is decided at attention time by a per-request LRU resident window + threshold.
+- **`sfa_pd_cpu_offload/`** — *PD-disaggregated layer built ON TOP of the base*. D (`kv_consumer`, `use_offload=true`) pulls P's (`kv_producer`, `use_offload=false`) prefill KV via **memfabric RDMA** into the CPU pool (main MLA) + HBM (indexer + partial). **Pull mode**: D advertises only contact info via a metaserver (HTTP, once/req); per-layer `READ_READY`/`READ_DONE` over ZMQ gates P's KV-buffer reuse. The D-side `SFAPDCpuOffloadConsumerWorker` **composes `SFAKVOffloadWorker`** to reuse the LRU load path. Three channels must not be conflated: metaserver=rendezvous, ZMQ=per-layer control, memfabric=data plane.
+
+Entry points / key invariants:
+- Total switch: `ascend_config.use_offload` (`--additional-config '{"use_offload": true}'`). It drives the hybrid MLA+indexer block layout in `worker/model_runner_v1.py::get_kv_cache_spec` (`OffloadMLAAttentionSpec` for main MLA + `AscendMLAAttentionSpec` for indexer; the "glm5.2, pad reused indexer module" comment is there). Scope: `use_offload` gates the **SFA decode** path only — prefill offload via `AscendStoreConnector` does **not** set it (see the three-paths table in `offload-merge-adaptation.md` §0.3).
+- Attention stays decoupled: `vllm_ascend/attention/sfa_v1.py::AscendSFAImpl` only calls three helpers in `attention/utils.py` — `wait_for_kv_layer_from_connector`, `maybe_save_kv_layer_to_connector` (end of each layer, the per-layer hand-off), `maybe_prepare_lru_resident_and_load_graph` — plus reads `use_offload`.
+- PD role comes from `KVTransferConfig` (`kv_role`, `is_kv_producer`, `is_kv_consumer`); the PD connector branches on these and **asserts P=`use_offload=false`, D=`use_offload=true`** at startup.
+- w4a8/w8a8 quantization is orthogonal to offload: it affects the matmul (weights/activations), not the transferred KV (which uses the separate `--kv-cache-dtype`).
+- GLM5.2 (`GlmMoeDsaForCausalLM`, MLA + DSA indexer) model backend is split across three layers: vLLM maps it to an **empty subclass** `GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM)` in `vllm/vllm/model_executor/models/deepseek_v2.py` (all logic inherited from DeepseekV2; registered in `models/registry.py`); the Ascend attention/indexer execution is `vllm_ascend/attention/sfa_v1.py::AscendSFAImpl`; the HF reference (config/weights only, not used for inference) is `transformers/models/glm_moe_dsa/`. `--trust-remote-code` is set but the model dir ships no modeling `.py` — it relies on the transformers-native module + the vLLM registry.
+
+## Workspace-root working artifacts (not in any repo)
+
+Loose files at the workspace root support the offload work. None are checked in anywhere.
+
+- `offload-merge-adaptation.md` — **newest artifact (Jul 12); read this FIRST for current
+  direction.** Design/change doc for adapting the offload subsystem to upstream **pr-11647**,
+  which splits the SFA indexer out of the packed MLA tuple into an independent spec
+  (`AscendSFAIndexerCacheSpec`). Covers commits `7d197056a` (merge pr-11647) → `75e53e296`
+  (offload adaptation of AscendStore + layerwise reuse, 10 files +484/−103), with a per-module
+  rationale and a GVA-layout diagram. ⚠️ Those commits are in the canonical repo's object DB
+  but **NOT on the checked-out HEAD** (`304ba9df0`) — the working tree still uses the *packed*
+  indexer model (`make_offload_indexer_mla_spec`, `sparse_kv_cache_has_indexer`,
+  `OffloadMLAAttentionSpec`); the separated spec is incoming. Its §0.3 three-paths table is
+  authoritative for which connector/flag each launch script uses.
+- `fix_1.md` … `fix_17.md` — **running journal of the offload work; highest number = newest.**
+  (latest `fix_17.md`, Jul 11.) Each entry is symptom → root cause → change, and later entries
+  build on earlier ones (e.g. `fix_10` opens "after fix_9…"). **Read the latest 2-3 before
+  investigating an offload issue** — the cause is often already pinned there. Themes so far:
+  SFA layerwise memcache decode precision, synchronizing the CPU save stream, MTP slot-mapping
+  compaction, cross-layer physical-tensor reuse under MTP (`fix_16`).
+- `0001-simply-mtp.patch`, `layerwise_pd_mix_decode.patch` — patches layered on top of the
+  `vllm-ascend*` clones (MTP simplification; layerwise PD-mix decode). `git status` inside the
+  target clone shows what's currently applied.
+- `extra-info/data-dump/{0..15}/` — per-rank (TP 0-15) tensor dumps from precision debugging.
+- `online.log`, `online_1.log` — runtime logs captured from `vllm serve`.
+- **Generated / caches — ignore when reasoning about structure:** `kernel_meta/` (NPU kernel
+  compile cache, ~1400 entries), `vllm-ascend-offload.tar.gz` (~350 MB packed clone),
+  `memfabric_hybrid-1.1.2_linux_aarch64.run` (MemFabric installer), `dsv4.jpg`.
+
+## Cross-cutting conventions (matter when jumping between repos)
+
+- **Two separate toolchains.** `vllm`/`vllm-ascend` are Python-first (`uv`/pip, pytest, ruff; line length 88 upstream, enforced via `format.sh` in the plugin). `memcache`/`memfabric_hybrid` are C++-first (CMake/Bazel, gtest, clang-format; line length 120). Don't mix conventions.
+- **`vllm` is read-only here.** Whether working in `vllm-ascend` or driving the developer Skill, do **not** modify upstream `vllm/` — Ascend behavior goes into `vllm-ascend/` via the patch/inheritance patterns in its AGENTS.md.
+- **Hardware context is Ascend NPU throughout.** Many test paths and perf rules (avoiding `tensor.item()` host-syncs; `tests/e2e/` NPU tests) require real Ascend hardware (910B/C, A2/A3) and must be verified on it.
+- **Submodules.** `memfabric_hybrid` and `memcache` use git submodules for test deps, and `memcache` vendors `memfabric_hybrid` under `3rdparty/`. Run `git submodule update --recursive --init` before the first build.
+- **Build artifacts are not source.** `build/`, `output/`, `compile_commands.json`, `wheels/`, and `*.so` under the C++ repos are generated — ignore them when reasoning about structure.
+- **Docs languages.** Several READMEs/guides (`vllm-ascend`, `memcache`, `memfabric_hybrid`, the developer skill) are in Chinese; `vllm`/`vllm-ascend` also ship English READMEs (`vllm-ascend` has `README.zh.md`).

@@ -1,0 +1,60 @@
+from typing import List, Dict
+from collections import defaultdict
+
+
+class Solution:
+    def __init__(self):
+        self.global_time = 0
+
+    def check_frame_free(self):
+        frame_ids = []
+        for frame in list(self.frame_ids.values()):
+            frame_ids.append(frame)
+        frame_ids.sort(key=lambda x: x["global_time"])
+
+        win_frame_ids = frame_ids[:self.window_size]
+        win_frame_ids.sort(key=lambda x: x["num"])
+        return win_frame_ids[0]["frame_id"]
+
+    def calc_page_fault_num(self, frame_num: int, window_size: int, pages: List[int]) -> int:
+        if frame_num >= len(pages):
+            return 0
+        self.frame_ids = defaultdict()
+        self.window_size = window_size
+        count = 0
+
+        for i in range(frame_num):
+            self.frame_ids[i] = {"page_id": -1, "global_time": 0, "num": 1, "frame_id": i}
+
+        for page_id in pages:
+            self.global_time += 1
+
+            for frame in list(self.frame_ids.values()):
+                if frame["page_id"] == page_id:
+                    frame["num"] += 1
+                    frame["global_time"] = self.global_time
+                    break
+            else:
+                # 缺页：先找空闲页框，没有空闲页框才发生置换
+                frame_id = None
+                for frame in list(self.frame_ids.values()):
+                    if frame["page_id"] == -1:
+                        frame_id = frame["frame_id"]
+                        break
+
+                if frame_id is None:
+                    frame_id = self.check_frame_free()
+                    count += 1
+
+                self.frame_ids[frame_id]["page_id"] = page_id
+                self.frame_ids[frame_id]["global_time"] = self.global_time
+                self.frame_ids[frame_id]["num"] = 1
+
+        return count
+
+
+if __name__ == "__main__":
+    sol = Solution()
+    print(sol.calc_page_fault_num(3, 2, [51, 52, 53, 54, 54, 51, 52, 53, 54]))  # 4
+    print(sol.calc_page_fault_num(3, 2,
+          [1, 2, 1, 2, 3, 4, 3, 4, 5, 5, 4, 3, 4, 3, 2, 1, 10, 20, 30, 50, 30, 20]))  # 9

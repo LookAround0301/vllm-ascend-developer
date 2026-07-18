@@ -1,0 +1,289 @@
+# DeepSeek V4 MoE Forward 数据流(vllm-ascend)
+
+本文记录 vllm-ascend 中 DeepSeek V4 MoE 的完整 forward 数据流,标注 `topk_ids` / `topk_weights`
+在各阶段的消费点。**仅覆盖 MoE 本身**(expert offload 的 paging/预取是独立主题,见其它文档)。
+
+## 符号 ↔ 本模型实际值
+
+| 符号 | 含义 | 本模型 (v4_w8a8) |
+|---|---|---|
+| `T` | num_tokens(连续 batching 拍平后的总 token) | 变 |
+| `H` | hidden_size | 4096 |
+| `I` | moe_intermediate_size(单 expert) | 2048 |
+| `E` | n_routed_experts | 256 |
+| `topk` | num_experts_per_tok | 6 |
+| `n_sh` | n_shared_experts | 1 |
+| `λ` | routed_scaling_factor | 1.5 |
+
+> 巧合:`2I = 4096 = H`(本模型 `n_sh=1`,所以 `I·n_sh = I = 2048`)。换模型后符号化图照样成立。
+
+## 主流程图
+
+标注:▸ = `topk_ids` 消费点;◆ = `topk_weights` 消费点。
+
+```
+                                 x  [T, H]
+                                 │ [T, H]
+          ┌──────────────────────┴────────────────────────────────────┐
+          │  路由链                                                 │  共享专家(dense)
+          ▼ [T, H]                                                ▼ [T, H]
+   ┌───────────────┐                                   ┌──────────────────────────────┐
+   │ gate  W [E,H] │  fp32                             │ gate_up_proj                 │
+   │ x.float()@Wᵰ  │                                   │  W [2·(I·n_sh), H] (w1;w3)   │
+   └──────┬────────┘                                   │  x@Wᵰ → [T, 2·(I·n_sh)]      │
+          │ [T, E] = router_logits                     └──────────────┬───────────────┘
+          ▼                                                           ▼
+   ╔═════════════════════════════╗                       ┌──────────────────┐
+   ║ select_experts              ║                       │ SwiGLU           │
+   ║  ① sqrtsoftplus → [T,E]     ║                       │ silu(gate)⊙up    │
+   ║  ② + bias[E] (仅选,不配重)   ║                       │ → [T, I·n_sh]    │
+   ║  ③ topk → ids/weights[T,topk]║                      └────────┬─────────┘
+   ║  ④ ÷Σ renorm → [T, topk]    ║                                │ [T, I·n_sh]
+   ╚══════════════╤══════╤═══════╝                                ▼
+       topk_ids │      │ topk_weights                  ┌──────────────────┐
+       [T,topk] │      │ [T, topk] ◆                   │ down_proj [H,I·n_sh]│
+                │      │                               │ x@Wᵰ → [T, H]     │
+                │      │  ┌── ◆ topk_weights 旁路(不进 expert 数值)─────┐
+                │      │  │  • offload: update_weights → LRC.observe(    │
+                │      │  │       router_scores=topk_weights)            │
+                │      │  │       [cache_router_weight≠0 才用]           │
+                │      │  │  • set_flash_common3_context(topk_weights=…) │
+                │      │  │  • maybe_all_gather_and_maybe_unpad(…) [EP]  │
+                │      │  └─────────────────────────────────────────────┘
+                ▼      │(携带,不消费)
+   ╔══════════════════════════════════╗
+   ║ ▶ prepare   (prepare_finalize)   ║   ◀── 用 router_logits, 不用 topk_*
+   ║   pad 对齐 / pertoken_scale /    ║
+   ║   all2all buffer / mc2_mask      ║
+   ║   → [T_padded, H] + 元数据       ║
+   ╚════════════════╤═════════════════╝
+                   ▼ [T_padded, H]
+   ╔══════════════════════════════════╗
+   ║ ▶ dispatch  (token_dispatcher)   ║
+   ║  ▸ 用 topk_ids:复制 topk 份、按   ║   ◀── topk_ids 消费点(选哪些/怎么分组)
+   ║    expert 重排,建 group_list[E]   ║
+   ║   (EP: all2all)                   ║
+   ║   → dispatched [T·topk, H]        ║
+   ║     group_list   [E]              ║
+   ╚════════════════╤═════════════════╝
+                   ▼ [T·topk, H]
+   ╔══════════════════════════════════╗
+   ║ ▶ Expert compute (_apply_mlp)    ║
+   ║   dynamic_quant → gmm1 → gmm2    ║   ◀── topk_ids/weights 都不进 gmm
+   ║   → expert_out [T·topk, H]        ║
+   ╚════════════════╤═════════════════╝
+                   ▼ [T·topk, H]
+   ╔══════════════════════════════════╗
+   ║ ▶ combine   (token_dispatcher)   ║
+   ║  ◆ hidden_states *= topk_weights ║   ◀── topk_weights 核心消费点(加权)
+   ║    + reverse-permute + scatter-  ║
+   ║      add  (T·topk → T)           ║
+   ║   → routed_out [T, H]            ║
+   ╚════════════════╤═════════════════╝
+                   ▼ [T, H]
+   ╔══════════════════════════════════╗
+   ║ ▶ finalize  (prepare_finalize)   ║   ◀── 不用 topk_*
+   ║   all-reduce(AllGather) / un-pad ║
+   ║   → routed [T, H]                ║
+   ╚════════════════╤═════════════════╝
+                   ▼ [T, H] = routed                  ▼ [T, H] = shared
+            ┌──────────────────────────────────────────────────────────┐
+            │   y  =  λ · routed  +  shared                            │   λ = routed_scaling_factor
+            └────────────────────────────────┬─────────────────────────┘
+                                             ▼ [T, H]
+                                      y  [T, H]   → 回 residual
+```
+
+## 消费点小结
+
+| 张量 | 核心消费 | 作用 |
+|---|---|---|
+| `topk_ids` ▸ | **dispatch** | 决定 token 复制几份、按哪个 expert 重排、建 group_list。结构/路由驱动。 |
+| `topk_weights` ◆ | **combine** | `hidden_states *= topk_weights` 加权每个 expert 输出,再 scatter-add。数值/混合驱动。 |
+
+两条线都从 `select_experts` 出来,**平行下穿** prepare/compute 不被消费,各自在 dispatch / combine 落地:
+- `topk_ids` 在 **dispatch** 被"用掉"(决定结构)。
+- `topk_weights` 在 **combine** 被"用掉"(决定数值)。
+- `topk_weights` 还有 3 个**旁路**消费者(offload LRC 热度、flash comm 上下文、EP 跨卡聚合),都不影响 expert 计算本身的数值。
+
+## 模块归属(三层抽象)
+
+| 层 | owner 类 | 函数 | 职责 |
+|---|---|---|---|
+| 通信层 | `prepare_finalize` | `prepare` + `finalize` | padding 对齐、all2all/allreduce、un-pad(一头一尾) |
+| 路由层 | `token_dispatcher` | `dispatch` + `combine` | token 散射(token→expert)/汇聚(expert→token),夹 compute 两边 |
+| 计算层 | `_apply_mlp` | `dynamic_quant → gmm1 → gmm2` | 分组 FFN |
+| 路由链 | `gate` + `select_experts` | — | 产 `topk_ids`/`topk_weights` 驱动 dispatch/combine |
+
+> `FusedMC2` comm type 下,prepare→dispatch→compute→combine→finalize 五段会融进**一个** `dispatch_ffn_combine` mega-op;上图是标准分段等价逻辑。
+
+## 维度流
+
+```
+[T,H] ─prepare(pad)→ [T_padded,H] ─dispatch(×topk)→ [T·topk,H] ─compute→ [T·topk,H]
+      ─combine(÷topk)→ [T,H] ─finalize(unpad+reduce)→ [T,H]
+```
+
+---
+
+## 路由变体:Hash-MoE(前 `num_hash_layers` = 3 层)
+
+主流程图画的是**标准路由**(第 3 层起)。前 3 层(layer 0/1/2)走 **hash-MoE**:expert id 直接由 **token id 查表**得到,不走 gate→sqrtsoftplus→topk。区别**只在 `select_experts` 这一步**,后续 prepare/dispatch/compute/combine 完全一样。
+
+```
+                         Hash-MoE 路由(前 3 层)
+                         ─────────────────────
+
+   x [T, H]                              input_ids [T]
+      │                                       │
+      ▼                                       │
+   ┌──────────────┐                          │
+   │ gate W [E,H] │  fp32                    │
+   │ x.float()@Wᵰ │                          │
+   └──────┬───────┘                          │
+          │ router_logits [T, E]             │
+          │  (只用来算权重!)                  │
+          │                                  ▼
+          │                ┌──────────────────────────────┐
+          │                │ tid2eid  [V, topk]           │  ← 学出来的 hash 表
+          │                │  = [129280, 6], int32        │     (requires_grad=False,
+          │                │                              │      前三层每层一份)
+          │                │   tid2eid[input_ids] 直接查表 │
+          │                └──────────────┬───────────────┘
+          │                               │
+          │                               ▼
+          │                       topk_ids [T, topk]   ★ 从 token id 来,
+          │                                              完全跳过 sqrtsoftplus/topk
+          │                               │
+          ▼ sqrtsoftplus(router_logits)    │
+            → 在 topk_ids 处 gather ───────▶│
+            → ÷Σ renorm                    │
+                │                          │
+                ▼                          │
+          topk_weights [T, topk] ◀─────────┘
+                │
+                ▼
+   (topk_ids, topk_weights)  →  后面 prepare/dispatch/gmm1-gmm2/combine 完全一样
+```
+
+对比:
+
+| | 标准 MoE(layer 3~42) | Hash-MoE(layer 0~1~2) |
+|---|---|---|
+| `topk_ids` 来源 | gate → router_logits → **sqrtsoftplus + topk over E** | **`tid2eid[input_ids]` 查表**(token id → expert id) |
+| `topk_weights` 来源 | sqrtsoftplus gather + ÷Σ | 一样(sqrtsoftplus gather + ÷Σ) |
+| gate 还跑吗 | 跑(产 router_logits) | **也跑**,但只用于算权重 |
+| `e_score_correction_bias` | 有(`[E]`) | **无**(hash 层设 None) |
+| `tid2eid` | 无 | `[V, topk]=[129280,6]` 查表 |
+| 选 expert 的开销 | topk over 256 | 一次查表(O(1)) |
+
+要点:
+- **只有"选哪些 expert"(topk_ids)换了来源** —— 从"算 logits 再 topk"变成"token id 直接查 `tid2eid` 表"。**权重(topk_weights)还是 gate 出的**,所以 hash 层 gate 照常算。
+- `tid2eid [V, topk]` 是**学出来后冻结**的 hash 表(`requires_grad=False`),token id 固定映射到 topk 个 expert —— 推理 O(1) 查表,省掉 256 路 topk。
+- 实现上是**一个融合算子** `moe_gating_top_k_hash(x=router_logits, input_ids, tid2eid, …)` 同时算出 topk_ids(查表)和 topk_weights(从 logits)。
+- **后续不变**:`topk_ids`/`topk_weights` 出来之后,prepare → dispatch → gmm1/gmm2 → combine → finalize、以及 `y = λ·routed + shared`,都和标准 MoE 一致 —— 主流程图下半部分对 hash 层同样适用。
+
+> 直觉:前几层 token 语义还比较"原始",token id 本身就是强信号,直接学一个 token→expert 映射比让 gate 现算更准更快;深层语义复杂了才回到 gate 路由。
+
+---
+
+## Appendix A — `select_experts` 4 步展开
+
+```
+              router_logits  [T, E]
+                     │ [T, E]
+                     ▼
+        ┌───────────────────────────────┐
+        │ ① scoring: sqrtsoftplus       │   ← DeepSeek V4 评分(非 softmax)
+        │   scores = softplus(logits)   │
+        │            .sqrt()  → [T, E]  │
+        └───────────────┬───────────────┘
+                        │ [T, E]
+                        ▼
+        ┌───────────────────────────────┐
+        │ ② + e_score_correction_bias   │   bias [E], 广播
+        │   scores += bias → [T, E]     │
+        └───────────────┬───────────────┘
+                        │ [T, E]
+                        ▼
+        ┌───────────────────────────────┐
+        │ ③ grouped_topk  (n_group=1    │
+        │   ⇒ 退化为 plain topk over E) │
+        │   → topk_ids/topk_weights     │
+        │     [T, topk]                 │
+        └───────────────┬───────────────┘
+                        │ [T, topk]
+                        ▼
+        ┌───────────────────────────────┐
+        │ ④ renormalize (÷Σ, 非 softmax) │   norm_topk_prob=True
+        │   → [T, topk]                 │
+        └───────────────────────────────┘
+```
+
+要点:
+- **sqrtsoftplus** = `softplus(logits).sqrt()`,DeepSeek V4 特有评分(替代 softmax)。
+- **④ 是 ÷Σ 不是 softmax**(`topk_weights /= topk_weights.sum()`),即 L1 归一化,不是 exp-based。
+- `e_score_correction_bias` **只用于选哪些 expert**(②),最终权重 `gather` 的是**无 bias 的原始 sqrtsoftplus 分数**再 ÷Σ —— 负载均衡技巧。
+
+## Appendix B — Expert compute 展开(`dynamic_quant → gmm1 → gmm2`)
+
+```
+        x_dispatched  [T·topk, H]   (bf16, 来自 Dispatch)
+              │
+              ▼
+   ┌─────────────────────────────┐
+   │ dynamic_quant               │   输入激活量化("A8")
+   │  x → x_q (int8)             │
+   │  + pertoken_scale           │
+   └──────────────┬──────────────┘
+                  │ x_q [T·topk, H] int8
+                  ▼
+   ╔══════════════════════════════════════════════╗
+   ║ gmm1 = npu_grouped_matmul_swiglu_quant_v2     ║   ← 融合①
+   ║   in:  x_q, w13_weight [2I,H], w1_scale,      ║      融合: matmul(w13)+SwiGLU+quant
+   ║         swiglu_limit                          ║      (intermediate 不落 HBM)
+   ║   内: matmul(x_q,w13) → [T·topk, 2I]          ║
+   ║       SwiGLU → [T·topk, I]                    ║
+   ║       quant → int8                            ║
+   ║   out: interm_q [T·topk, I] int8              ║
+   ╚════════════════════════╤═════════════════════╝
+                           │ intermediate_q [T·topk, I] int8
+                           ▼
+   ╔══════════════════════════════════════════════╗
+   ║ gmm2 = npu_grouped_matmul (gmm2 变体)         ║   ← 融合②
+   ║   in:  interm_q, w2_weight [H,I], w2_scale    ║      融合: dequant + matmul(w2)
+   ║   内: dequant(interm_q) → [T·topk, I]         ║
+   ║       matmul(·,w2) → [T·topk, H]              ║
+   ║   out: expert_out [T·topk, H] bf16            ║
+   ╚════════════════════════╤═════════════════════╝
+                           ▼
+                expert_out  [T·topk, H]   → 喂给 Combine
+```
+
+要点:
+- w1/w3 合并:`w13_weight [2I,H]`;swiglu 只融进 **gmm1**(不是整个 FFN 一个 op),w2 是独立 **gmm2**。
+- intermediate 量化成 int8 节省带宽,gmm2 入口 dequant。
+- `group_list` 贯穿 gmm1/gmm2,告诉算子每个 expert 对应哪段 token。
+
+## Appendix C — 单 expert 数学结构
+
+```
+          x [T_e, H]   (路由到 expert e 的 token 子集)
+          ┌────┴─────┐
+          ▼          ▼
+   w1(gate)[I,H]  w3(up)[I,H]      ← w13=[w1;w3] 合并存储 [2I,H]
+    x·w1ᵰ        x·w3ᵰ
+   [T_e,I]      [T_e,I]
+          │          │
+     SiLU(gate)      │
+      [T_e,I]        │
+          └────⊙─────┘ (gated mul)
+               │
+        intermediate [T_e, I]
+               │
+        w2(down)[H,I] ·w2ᵰ
+               ▼
+          E_e(x) [T_e, H]
+
+   routed = Σ_{j=1..topk} topk_weights[j] · E_{topk_ids[j]}(x)   →  [T, H]
+```

@@ -1,0 +1,28 @@
+# clawd-term（终端版桌宠）
+
+在 tmux 窗格里随 Claude Code 状态动的终端桌宠，由 HyperScript 的
+`install_clawd_pet()` 安装到 `~/.claude/pet/`。
+
+## 文件
+
+| 文件 | 说明 |
+|------|------|
+| `pet.py` | 渲染器：读状态 → 把精灵图帧渲染成 ANSI 真彩色 + ▀ 半块的终端字符画 |
+| `hook.sh` | Claude Code hook 处理器：事件 → 状态词（写入 `~/.claude/pet/state`） |
+| `merge_hooks.py` | 把 hooks 写进 `~/.claude/settings.json`（幂等，备份 `.bak-pet`） |
+| `start.sh` | tmux 启动器：`col`/`bottom`/`mid`/`big` |
+| `codenono.webp` | CodeNoNo 精灵图（见下方归属） |
+
+## 归属 / 许可
+
+- `pet.py` / `hook.sh` / `start.sh` / `merge_hooks.py`：为本项目自带的脚本。
+- `codenono.webp`：**CodeNoNo** 角色精灵图，作者 **Dqd02**
+  （[github.com/Dqd02](https://github.com/Dqd02)），来自
+  [awesome-codex-pet](https://github.com/rullerzhou-afk/awesome-codex-pet)
+  画廊（`pets/codenono--dq02/`）。此处为离线安装**内置副本**，
+  版权与许可归原作者所有；如作者有异议请移除该文件，安装器会回退到
+  在线下载或本地 `awesome-codex-pet` 路径。
+
+## 运行时依赖（安装时自动装，非文件）
+
+- `tmux`（apt）、`python3` + `Pillow`（pip）

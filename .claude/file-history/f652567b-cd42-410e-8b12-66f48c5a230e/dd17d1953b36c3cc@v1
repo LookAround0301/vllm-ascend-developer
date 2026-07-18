@@ -1,0 +1,104 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Overview
+
+Multi-repo workspace for developing **MoE expert weight offloading** on vLLM-Ascend (Huawei Ascend NPU). The primary development happens in `vllm-ascend/`; `vllm/` is an upstream vLLM reference copy used for understanding APIs and debugging.
+
+- **vllm/** — upstream vLLM (pinned to a dev branch with MoE offload support, currently on `moe_offload_support_dsv4` commit)
+- **vllm-ascend/** — vLLM Ascend hardware plugin; active development happens here
+- **scripts/run.sh** — example launch script for serving DeepSeek V4 with expert offloading on Ascend NPU
+
+> **Read `vllm-ascend/AGENTS.md`** before any contribution. It is the authoritative contributor guide (env-var rules, NPU hot-path constraints, patching/inheritance patterns, commit & PR format, review checklists). The conventions there are stricter than what's summarized here.
+
+## Key architecture
+
+### Expert Offloading (`vllm_ascend/expert_offload/`)
+
+The core feature being developed. MoE models have many experts (e.g., 128) that don't fit on NPU memory, so weights are stored on CPU and paged to NPU at runtime based on routing decisions.
+
+- **`ExpertOffloadManager`** (`expert_offload_manager.py`) — process-wide singleton (access via `ExpertOffloadManager.get_instance()`, set in `__init__`) that stores all expert weights on pinned CPU memory, paging `num_device_experts` experts to NPU. Owns CPU→NPU copy streams (`load_stream`, `_prefetch_stream`) and the background `_prefetch_thread` (guarded by `_prefetch_state_lock`) that issues next-expert H2D copies off the forward path. Manages prefill pools (round-robin shared across `num_device_layers` layers) and decode paging via cache policy.
+- **`LRCExpertCachePolicy`** (`lrc_policy.py`) — Local-Routing-Consistency eviction policy. CPU-only online approximation of SCH using recent routing frequency, EMA hotness, router scores, and age to decide which resident expert to evict on a cache miss.
+- **`utils.py`** — `init_expert_offload_config()` (generates `expert_map_offload`) and `init_log2phy_for_offload()` called during model init.
+- **`ExpertOffloadConfig`** (in `ascend_config.py:775`) — driven by `--additional-config '{"expert_offload_config": {...}}'` passed to `vllm serve`. Key knobs: `expert_offload` (master switch), `num_device_experts` (default 32), `num_device_layers` (default 2), `cache_policy_enabled`, `expert_prefetch_enabled`, `moe_offload_debug` (master switch for offload diagnostics — UPDATE-W cache trace, per-prefill-load logs, slot shortfalls; shown at info level when on). The `cache_*` knobs (`cache_recent_window`, `cache_ema_beta`, `cache_recent_weight`, `cache_ema_weight`, `cache_router_weight`, `cache_age_weight`) map 1:1 onto `LRCExpertCachePolicy.__init__`.
+
+### Prefetch Offloader (`vllm_ascend/model_executor/offloader/prefetch.py`)
+
+Generic NPU port of upstream vLLM's `PrefetchOffloader` (`NPUPrefetchOffloader`). It offloads **whole module/layer parameters** (not individual experts) between NPU and CPU/pinned memory over a dedicated `copy_stream` with a `StaticBufferPool`, reusing upstream's `_BaseParamOffloader`. Enabled via `--safetensors-load-strategy prefetch`.
+
+> Note: the background-thread **expert** prefetch (`_prefetch_thread`, `_prefetch_stream`, `_prefetch_state_lock`) belongs to `ExpertOffloadManager`, **not** this module. Don't conflate the two — `prefetch.py` is about layer weights; expert paging is the offload manager.
+
+### Model support (`vllm_ascend/models/`)
+
+- **`deepseek_v4.py`** — DeepSeek V4 model implementation with MoE-specific forward logic. Works with `ExpertOffloadManager`.
+- **`layer/attention/`** — custom attention layer implementations for DeepSeek V4.
+- Patching in `vllm_ascend/patch/worker/` modifies upstream model behavior at runtime (e.g., DeepSeek-specific patches).
+
+### ACL Graph compilation (`vllm_ascend/compilation/`)
+
+NPU graph capture/compilation infrastructure. `acl_graph.py` manages ACL graph lifecycle; `compiler_interface.py` interfaces with the Ascend compiler; `passes/` contains graph optimization passes.
+
+### Plugin architecture (`vllm_ascend/patch/`)
+
+vLLM-Ascend uses the upstream vLLM hardware-pluggable interface. NPU-specific behaviors are injected via:
+1. **Patching** — monkey-patching upstream classes at import time (`patch/platform/`, `patch/worker/`)
+2. **Inheritance** — `NPUModelRunner(GPUModelRunner)`, `AscendSampler`, etc.
+3. **Custom ops** — compiled C++ kernels in `csrc/` (Moe ops, attention kernels, GMM)
+
+## Environment variables
+
+All env vars are centralized in `vllm_ascend/envs.py` in the `env_variables` dict. Follow the `VLLM_ASCEND_*` naming convention. Key ones:
+- `VLLM_ASCEND_ENABLE_NZ` — enable fractal NZ memory format
+- `COMPILE_CUSTOM_KERNELS` — set to `0` only for non-NPU UT environments
+
+## Build & Development
+
+Work in `vllm-ascend/` for all changes.
+
+```bash
+# Build C++ extensions (from vllm-ascend/csrc/)
+cd vllm-ascend && bash csrc/build.sh
+
+# Install vllm-ascend in dev mode
+cd vllm-ascend && pip install -e .
+
+# Lint (uses pre-commit)
+cd vllm-ascend && bash format.sh          # all hooks on all files
+cd vllm-ascend && bash format.sh ci        # manual-stage hooks (including mypy)
+
+# Run a specific unit test
+cd vllm-ascend && pytest -sv tests/ut/path/to/test_file.py::test_name
+
+# Run a specific E2E test (requires NPU hardware)
+cd vllm-ascend && pytest -sv tests/e2e/path/to/test_file.py::test_name
+
+# LRC eviction policy is CPU-only and unit-testable without NPU
+cd vllm-ascend && pytest -sv tests/ut/expert_offload/test_lrc_policy.py
+```
+
+### Serving DeepSeek V4 with offloading
+
+`scripts/run.sh` is the reference launch. The offload-relevant `vllm serve` flags:
+
+- `--additional-config '{"expert_offload_config": {...}}'` — the `ExpertOffloadConfig` knobs above.
+- `--safetensors-load-strategy prefetch` — wires in the `NPUPrefetchOffloader` (layer-weight offload, distinct from expert offload).
+- `--quantization ascend` — native Ascend W8A8 path; weights load in fractal NZ format.
+- `--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'` — ACL graph captures decode only (offload paging is not graph-safe in prefill).
+- `--enable-chunked-prefill` / `--enable-prefix-caching` — both enabled in the reference script.
+
+## Commit conventions
+
+- Conventional Commits: `<type>(<scope>): <summary>` with `Signed-off-by:` trailer (`git commit -s`)
+- Valid types: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore`
+- PR titles: `[Type][Module] Description` (e.g., `[Feat][Worker] Add next-layer prefetch`)
+
+## Important constraints
+
+- **Never hardcode env var names** — always import from `vllm_ascend.envs`
+- **`tensor.item()` causes NPU→CPU sync** — avoid in hot paths; batch or keep on device
+- **NPU uses fractal NZ format** (`ACL_FORMAT_FRACTAL_NZ`) for weight storage; transpose happens in `process_weights_after_loading()`
+- **Expert offload uses pinned CPU memory** — all CPU-side expert weight buffers are `pin_memory=True`
+- **The prefetch thread writes to NPU from a background thread** — NPU streams and events coordinate with the main forward thread; the `_prefetch_state_lock` protects shared state
+- **C++ kernels in `csrc/`** are compiled via `csrc/build.sh` with CMake; custom MoE ops (`AscendFusedMoE`), attention kernels, and batch matmul ops live there
+- **vllm/** should generally not be modified directly; changes flow upstream via PRs to vllm-project/vllm

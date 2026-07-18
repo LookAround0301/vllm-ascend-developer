@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# clawd-term 启动器。在【普通 shell】里运行（不要在 claude 会话内嵌套）。
+#
+# 形象：PET_PET=codenono(默认)/bubu/yier；不传参时菜单选。
+#
+# 不传参 = 交互菜单（选形象 + 选布局）：
+#   bash ~/.claude/pet/start.sh               # 弹菜单：先选形象再选布局（默认行为）
+#
+# 直接指定布局（跳过菜单）：
+#   bash ~/.claude/pet/start.sh col           # 右侧整高窄列（推荐）
+#   bash ~/.claude/pet/start.sh bottom        # 底部窄条（最省地）
+#   bash ~/.claude/pet/start.sh mid           # 右侧正中小方格
+#   bash ~/.claude/pet/start.sh big           # 底部大尺寸
+#   PET_PET=bubu bash ~/.claude/pet/start.sh col   # 直接指定形象+布局
+#
+# 进入后在主窗格运行 claude；桌宠随状态变化。
+# 分离保留后台：Ctrl+B 然后 D；重连：再跑一次本脚本。
+set -euo pipefail
+PET_DIR="${HOME}/.claude/pet"
+SESSION="clawd-pet"
+MODE="${1:-pick}"   # 不传参 = 弹菜单选形象+布局；传 col/bottom/mid/big = 直接指定
+export PET_PET="${PET_PET:-codenono}"   # 桌宠形象：codenono / bubu / yier
+
+mkdir -p "$PET_DIR"
+[ -f "$PET_DIR/state" ] || echo idle > "$PET_DIR/state"
+[ -f "$PET_DIR/ts" ] || date +%s > "$PET_DIR/ts"
+
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "未安装 tmux。先执行：apt-get install -y tmux" >&2
+    exit 1
+fi
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    exec tmux attach -t "$SESSION"
+fi
+
+# ---- 交互式菜单：start.sh 不传参（先选形象，再选布局）----
+choose_pet() {
+    local names=("codenono" "bubu" "yier")
+    local labels=("CodeNoNo（机器人）" "Bubu" "Yi Er（一二）")
+    local cursor=0 key i
+    tput civis 2>/dev/null
+    while true; do
+        clear
+        echo -e "\033[32m======== 选择桌宠形象 ========\033[0m"
+        for i in 0 1 2; do
+            if [ "$i" -eq "$cursor" ]; then
+                echo -e "\e[7m> ${labels[$i]}\e[0m"
+            else
+                echo "  ${labels[$i]}"
+            fi
+        done
+        echo -e "\033[33m  ↑↓ 选择，Enter 确认\033[0m"
+        IFS= read -rsn1 key
+        if [[ "$key" == $'\x1b' ]]; then
+            IFS= read -rsn2 -t 0.1 key
+            if [[ "$key" == "[A" ]]; then cursor=$(( (cursor - 1 + 3) % 3 )); fi
+            if [[ "$key" == "[B" ]]; then cursor=$(( (cursor + 1) % 3 )); fi
+            continue
+        fi
+        if [[ "$key" == "" ]]; then break; fi
+    done
+    tput cnorm 2>/dev/null
+    PET_PET="${names[$cursor]}"
+    export PET_PET
+}
+
+choose_layout() {
+    local labels=("col    右侧窄列（推荐）" "bottom 底部窄条（最省地）" "mid    右侧正中小方格" "big    底部大尺寸")
+    local map=("col" "bottom" "mid" "big")
+    local cursor=0 key i
+    tput civis 2>/dev/null
+    while true; do
+        clear
+        echo -e "\033[32m======== 选择布局（当前形象: ${PET_PET}）========\033[0m"
+        for i in 0 1 2 3; do
+            if [ "$i" -eq "$cursor" ]; then
+                echo -e "\e[7m> ${labels[$i]}\e[0m"
+            else
+                echo "  ${labels[$i]}"
+            fi
+        done
+        echo -e "\033[33m  ↑↓ 选择，Enter 确认\033[0m"
+        IFS= read -rsn1 key
+        if [[ "$key" == $'\x1b' ]]; then
+            IFS= read -rsn2 -t 0.1 key
+            if [[ "$key" == "[A" ]]; then cursor=$(( (cursor - 1 + 4) % 4 )); fi
+            if [[ "$key" == "[B" ]]; then cursor=$(( (cursor + 1) % 4 )); fi
+            continue
+        fi
+        if [[ "$key" == "" ]]; then break; fi
+    done
+    tput cnorm 2>/dev/null
+    LAYOUT="${map[$cursor]}"
+}
+
+if [ "$MODE" = "pick" ]; then
+    choose_pet
+    choose_layout
+    MODE="$LAYOUT"
+fi
+
+# 探测「当前形象(PET_PET)」的贴合尺寸（宽 高）——必须在菜单之后，才能匹配所选形象
+read FIT_W FIT_H < <(PET_SIZE=mini PET_SIZE_ONLY=1 python3 "${PET_DIR}/pet.py") || true
+FIT_W="${FIT_W:-40}"; FIT_H="${FIT_H:-24}"
+
+tmux new-session -d -s "$SESSION"
+# 隐藏窗格分隔线（边框颜色 = 背景），桌宠看着像浮在 claude 右边
+tmux set-option -t "$SESSION" pane-border-style "fg=black" 2>/dev/null || true
+tmux set-option -t "$SESSION" pane-active-border-style "fg=black" 2>/dev/null || true
+case "$MODE" in
+    col)
+        # 右侧整高窄列：col [宽]。单窗格、无空白；桌宠由 pet.py 垂直居中。
+        W="${2:-$FIT_W}"
+        if [ "${W}" -le 10 ] 2>/dev/null; then SZ=tiny; else SZ=mini; fi
+        tmux split-window -h -t "$SESSION":0.0 -l "$W" "PET_SIZE=${SZ} python3 ${PET_DIR}/pet.py; sh"
+        ;;
+    mid)
+        # 右侧正中小方格：mid [宽] [高]。上下用 tail 静默留白（tmux 切小格必然剩空白）。
+        W="${2:-$FIT_W}"; C="${3:-$FIT_H}"
+        if [ "${W}" -le 10 ] 2>/dev/null; then SZ=tiny; else SZ=mini; fi
+        tmux split-window -h -t "$SESSION":0.0 -l "$W"
+        tmux split-window -v -t "$SESSION":0.1
+        tmux split-window -v -t "$SESSION":0.2
+        WH=$(tmux display -t "$SESSION" -p '#{window_height}')
+        A=$(( (WH - C - 2) / 2 )); [ "$A" -lt 1 ] && A=1
+        tmux resize-pane -t "$SESSION":0.1 -y "$A"
+        tmux resize-pane -t "$SESSION":0.3 -y "$A"
+        tmux resize-pane -t "$SESSION":0.2 -y "$C"
+        tmux respawn-pane -t "$SESSION":0.2 -k "PET_SIZE=${SZ} python3 ${PET_DIR}/pet.py"
+        tmux respawn-pane -t "$SESSION":0.1 -k "tail -f /dev/null"
+        tmux respawn-pane -t "$SESSION":0.3 -k "tail -f /dev/null"
+        ;;
+    big)
+        tmux split-window -v -t "$SESSION":0.0 -l 9 "PET_SIZE=big python3 ${PET_DIR}/pet.py; sh"
+        ;;
+    bottom|*)
+        # 底部窄条：bottom [高]，默认=桌宠高。claude 保持满宽，只占底部几行。
+        BH="${2:-$FIT_H}"
+        tmux split-window -v -t "$SESSION":0.0 -l "$BH" "PET_SIZE=mini python3 ${PET_DIR}/pet.py; sh"
+        ;;
+esac
+tmux select-pane -t "$SESSION":0.0
+tmux attach -t "$SESSION"

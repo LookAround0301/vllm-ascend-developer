@@ -1,0 +1,1380 @@
+#!/bin/bash
+
+# HyperScript 一键安装脚本
+# 交互式 TUI 菜单（上下键 + 空格多选 + 回车确认）
+# 支持功能：安装 vllm / vllm-ascend、创建容器、NPU 查询、万能杀、安装 Claude Code 等
+
+# set -euo pipefail
+
+# ==================== 颜色定义 ====================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# ==================== 代理配置 ====================
+DEFAULT_PROXY_IP="141.3.169.143"
+DEFAULT_PROXY_PORT="8080"
+
+# ==================== Docker 容器配置 ====================
+DEFAULT_CONTAINER_NAME="super_test"
+DEFAULT_IMAGE_ID="8eec2957a42c"
+
+# ==================== vLLM / vLLM-Ascend 配置 ====================
+DEFAULT_VLLM_REPO="https://github.com/vllm-project/vllm"
+DEFAULT_VLLM_ASCEND_REPO="https://github.com/vllm-project/vllm-ascend.git"
+DEFAULT_VLLM_BRANCH="v0.21.0"
+DEFAULT_VLLM_ASCEND_BRANCH="main"
+DEFAULT_VLLM_INSTALL_DIR="$(pwd)"
+DEFAULT_VLLM_ASCEND_INSTALL_DIR="$(pwd)"
+
+# ==================== 运行时状态 ====================
+
+# 脚本所在目录(定位同级附带文件, 如 statusline.py)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ==================== Claude Code 配置 ====================
+# x86: linux-x64
+DEFAULT_NODE_VERSION="v24.14.0"
+DEFAULT_NODE_ARCH="linux-arm64"
+DEFAULT_NODE_MIRROR_BASE="https://mirrors.huaweicloud.com/nodejs"
+# 备选 npm 镜像源（按需取消注释）：
+# npm config set registry https://mirrors.tools.huawei.com/npm/
+# npm config set registry http://mirrors.cloud.tencent.com/npm/
+# npm config set registry https://registry.npmmirror.com
+# npm config set registry https://mirrors.huaweicloud.com/repository/npm/
+DEFAULT_NPM_REGISTRY="https://registry.npmmirror.com"
+DEFAULT_CLAUDE_CODE_INSTALL_DIR="$(pwd)"
+
+# ==================== 通用工具函数 ====================
+
+# 输出绿色 [INFO] 日志
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+# 输出黄色 [WARN] 日志（整行黄色）
+log_warn() {
+    echo -e "${YELLOW}[WARN] $1${NC}"
+}
+
+# 输出红色 [ERROR] 日志
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# 输出成功日志（整行绿色）
+log_success() {
+    echo -e "${GREEN}[INFO] ✅ $1${NC}"
+}
+
+# 输出失败日志（整行红色）
+log_fail() {
+    echo -e "${RED}[FAIL] ❌ $1${NC}"
+}
+
+# 检查命令是否存在，不存在则退出
+check_command() {
+    if ! command -v $1 &> /dev/null; then
+        log_error "命令 $1 不存在，请检查环境"
+        exit 1
+    fi
+}
+
+# 检查文件是否存在，不存在则退出
+check_file() {
+    if [ ! -f "$1" ]; then
+        log_error "文件 $1 不存在"
+        exit 1
+    fi
+}
+
+# 检查目录是否存在，不存在则退出
+check_dir() {
+    if [ ! -d "$1" ]; then
+        log_error "目录 $1 不存在"
+        exit 1
+    fi
+}
+
+# 确保目录存在，不存在则自动创建
+ensure_dir() {
+    local target_dir="$1"
+    if [ ! -d "${target_dir}" ]; then
+        echo "目录 ${target_dir} 不存在，正在创建..."
+        mkdir -p "${target_dir}"
+        if [ $? -ne 0 ]; then
+            log_error "创建目录 ${target_dir} 失败"
+            exit 1
+        fi
+    fi
+}
+
+# 确认是否继续（y/n，默认y），输入 n 则 return 0 中断调用方
+confirm_to_continue() {
+    local confirm
+    while true; do
+        read -e -p "确认开始安装？(y/n，默认y)：" confirm
+        confirm=$(echo "${confirm}" | xargs || echo "y")
+        confirm=${confirm:-y}
+        confirm=$(echo "${confirm}" | tr 'A-Z' 'a-z')
+        if [[ "${confirm}" =~ ^[YyNn]$ ]]; then
+            break
+        else
+            log_error "输入无效！请输入 y 或 n"
+        fi
+    done
+    if [ "${confirm}" != "y" ]; then
+        log_info "已取消安装"
+        return 1
+    fi
+    return 0
+}
+
+# 交互式选择并切换到有效的远程分支
+select_valid_branch() {
+    local repo_dir="$1"
+    local repo_name="$2"
+
+    if [ -z "${repo_dir}" ] || [ ! -d "${repo_dir}" ]; then
+        >&2 echo "[ERROR] 仓库目录不存在或为空：${repo_dir}"
+        exit 1
+    fi
+    if [ -z "${repo_name}" ]; then
+        >&2 echo "[ERROR] 仓库名称不能为空"
+        exit 1
+    fi
+
+    cd "${repo_dir}" || {
+        >&2 echo "[ERROR] 无法进入仓库目录 ${repo_dir}"
+        exit 1
+    }
+
+    >&2 echo "正在拉取 ${repo_name} 所有远程分支信息..."
+    if ! git fetch origin --all >/dev/null 2>&1; then
+        >&2 echo "[WARNING] 拉取远程分支信息失败，将使用本地已有分支列表"
+    fi
+
+    local all_branches
+    all_branches=$(git branch -a | \
+                   grep -E '^[[:space:]]*remotes/origin/' | \
+                   grep -v -E 'HEAD|->' | \
+                   sed -e 's/^[[:space:]]*remotes\/origin\///g' -e 's/[[:space:]]*$//g' | \
+                   sort -u)
+
+    if [ -z "${all_branches}" ]; then
+        >&2 echo "[ERROR] 未找到 ${repo_name} 的有效分支"
+        exit 1
+    fi
+
+    >&2 echo -e "\n===== ${repo_name} 所有可用分支 ====="
+    echo "${all_branches}" | while read -r branch; do
+        >&2 echo "  - ${branch}"
+    done
+    >&2 echo "======================================="
+
+    local selected_branch
+    while true; do
+        read -e -p "请输入要 checkout 的 ${repo_name} 分支名（直接回车使用默认分支 main）：" selected_branch
+        selected_branch=$(echo "${selected_branch}" | xargs)
+
+        if [ -z "${selected_branch}" ]; then
+            selected_branch="main"
+            >&2 echo "未输入分支名，将使用默认分支：${selected_branch}"
+        fi
+
+        if echo "${all_branches}" | grep -i "^${selected_branch}$" >/dev/null; then
+            selected_branch=$(echo "${all_branches}" | grep -i "^${selected_branch}$" | head -n1)
+            >&2 echo "选择的分支有效：${selected_branch}"
+            break
+        else
+            >&2 echo "[ERROR] 分支 ${selected_branch} 不存在，请重新输入！"
+            >&2 echo "当前可用分支列表："
+            echo "${all_branches}" | while read -r branch; do
+                >&2 echo "  - ${branch}"
+            done
+        fi
+    done
+
+    >&2 echo "正在切换到 ${repo_name} 的 ${selected_branch} 分支..."
+    if ! git fetch origin "${selected_branch}" >/dev/null 2>&1; then
+        >&2 echo "[WARNING] 拉取 ${selected_branch} 分支最新代码失败，将使用本地代码"
+    fi
+
+    if git checkout "${selected_branch}" >/dev/null 2>&1; then
+        >&2 echo "成功切换到已存在的分支：${selected_branch}"
+    else
+        if git checkout -b "${selected_branch}" --track "origin/${selected_branch}" >/dev/null 2>&1; then
+            >&2 echo "成功创建并切换到分支：${selected_branch}"
+        else
+            >&2 echo "[ERROR] checkout ${repo_name} 的 ${selected_branch} 分支失败"
+            exit 1
+        fi
+    fi
+
+    cd - >/dev/null 2>&1 || exit 1
+}
+
+# 获取安装目录（CLI参数 > 环境变量 > 交互输入 > 默认值）
+get_install_dir() {
+    local cli_dir="$1"
+    local default_dir="$(pwd)"
+    local install_dir=""
+    local user_input_dir=""
+
+    if [ -n "${cli_dir}" ]; then
+        install_dir=$(echo "${cli_dir}" | sed -e 's/[^a-zA-Z0-9\/_-]//g' -e 's/^\s*//g' -e 's/\s*$//g')
+        >&2 log_info "使用命令行指定的安装目录：${install_dir}"
+    elif [ -n "${VLLM_INSTALL_DIR:-}" ]; then
+        install_dir=$(echo "${VLLM_INSTALL_DIR}" | sed -e 's/[^a-zA-Z0-9\/_-]//g' -e 's/^\s*//g' -e 's/\s*$//g')
+        >&2 log_info "使用环境变量 VLLM_INSTALL_DIR 指定的目录：${install_dir}"
+    else
+        >&2 read -e -p "请输入安装目录（默认：${default_dir}）：" user_input_dir
+        user_input_dir=$(echo "${user_input_dir}" | sed -e 's/[^a-zA-Z0-9\/_-]//g' -e 's/^\s*//g' -e 's/\s*$//g')
+        install_dir="${user_input_dir:-${default_dir}}"
+        >&2 log_info "确认安装目录：${install_dir}"
+    fi
+
+    if [[ ! "${install_dir}" =~ ^/ ]]; then
+        >&2 log_warn "警告：输入的不是绝对路径，自动转换为绝对路径..."
+        install_dir=$(realpath -m "${install_dir}")
+        >&2 log_info "转换后的绝对路径：${install_dir}"
+    fi
+
+    mkdir -p "$(dirname "${install_dir}")" || {
+        >&2 log_error "无法创建安装目录的父路径 $(dirname "${install_dir}")"
+        exit 1
+    }
+
+    install_dir=$(echo "${install_dir}" | sed 's:/*$::')   # 去除末尾斜杠
+    echo "${install_dir}"
+}
+
+# ==================== 安装函数 ====================
+
+# 安装 vllm（源码安装，参数：安装目录、仓库地址、分支）
+install_vllm() {
+    local install_dir="${1:-$DEFAULT_VLLM_INSTALL_DIR}"
+    local ascend_repo="${2:-$DEFAULT_VLLM_REPO}"
+    local branch="${3:-$DEFAULT_VLLM_BRANCH}"
+    local skip_confirm="${4:-}"
+    local pkg_name="vllm"
+    local repo_name="vllm"
+
+    install_dir=$(echo "${install_dir}" | sed -e 's/[^a-zA-Z0-9\/_-]//g' -e 's/^\s*//g' -e 's/\s*$//g' -e 's:/*$::')
+    [[ ! "${install_dir}" =~ ^/ ]] && install_dir=$(realpath -m "${install_dir}")
+
+    # 清理旧版本
+    if pip show "${pkg_name}" >/dev/null 2>&1; then
+        if pip uninstall -y -q "${pkg_name}" >/dev/null 2>&1; then
+            log_success "已卸载旧版本 ${pkg_name}"
+        else
+            log_warn "卸载 ${pkg_name} 失败，尝试强制清理..."
+            pip uninstall -y "${pkg_name}" || {
+                log_fail "旧版本 ${pkg_name} 卸载失败，请手动执行：pip uninstall -y ${pkg_name}"
+                return 1
+            }
+        fi
+    fi
+
+    # 单独调用时显示详情并确认
+    if [[ -z "$skip_confirm" ]]; then
+        echo -e "${GREEN}── 安装 ${repo_name} ──${NC}"
+        log_info "目录：${install_dir} | 仓库：${ascend_repo} | 分支：${branch}"
+        confirm_to_continue || return 0
+    fi
+
+    ensure_dir "${install_dir}"
+
+    # 克隆/更新仓库
+    local repo_dir="${install_dir}/${repo_name}"
+    if [ -d "${repo_dir}" ]; then
+        log_info "${repo_name} 仓库已存在，更新中..."
+    else
+        log_info "正在克隆 ${repo_name} 仓库..."
+        if ! git clone "${ascend_repo}" "${repo_dir}"; then
+            log_error "克隆 ${repo_name} 仓库失败"
+            return 1
+        fi
+    fi
+
+    cd "${repo_dir}" || { log_error "无法进入仓库目录 ${repo_dir}"; return 1; }
+
+    # 切换分支
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if [ "${current_branch}" != "${branch}" ]; then
+        log_info "切换分支 ${current_branch} → ${branch}"
+        git fetch origin "${branch}" >/dev/null 2>&1 || true
+        if git checkout "${branch}" >/dev/null 2>&1; then
+            :
+        elif git checkout -b "${branch}" --track "origin/${branch}" >/dev/null 2>&1; then
+            :
+        else
+            log_warn "分支 ${branch} 不存在，请从已有分支中选择"
+            if ! select_valid_branch "${repo_dir}" "${repo_name}"; then
+                log_error "选择分支失败"
+                return 1
+            fi
+        fi
+    fi
+
+    # 安装
+    log_info "正在安装 ${repo_name} 包（可能耗时较长）..."
+    if VLLM_TARGET_DEVICE=empty pip install -v -e . --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple; then
+        log_success "${repo_name} 包安装成功！"
+    else
+        log_fail "${repo_name} 包安装失败，请检查上述错误日志"
+        return 1
+    fi
+}
+
+# 安装 vllm-ascend（源码安装，参数：安装目录、仓库地址、分支）
+install_vllm_ascend() {
+    local install_dir="${1:-$DEFAULT_VLLM_ASCEND_INSTALL_DIR}"
+    local ascend_repo="${2:-$DEFAULT_VLLM_ASCEND_REPO}"
+    local branch="${3:-$DEFAULT_VLLM_ASCEND_BRANCH}"
+    local skip_confirm="${4:-}"
+    local pkg_name="vllm_ascend"
+    local repo_name="vllm-ascend"
+
+    install_dir=$(echo "${install_dir}" | sed -e 's/[^a-zA-Z0-9\/_-]//g' -e 's/^\s*//g' -e 's/\s*$//g' -e 's:/*$::')
+    [[ ! "${install_dir}" =~ ^/ ]] && install_dir=$(realpath -m "${install_dir}")
+
+    # 清理旧版本
+    if pip show "${pkg_name}" >/dev/null 2>&1; then
+        if pip uninstall -y -q "${pkg_name}" >/dev/null 2>&1; then
+            log_success "已卸载旧版本 ${pkg_name}"
+        else
+            log_warn "卸载 ${pkg_name} 失败，尝试强制清理..."
+            pip uninstall -y "${pkg_name}" || {
+                log_fail "旧版本 ${pkg_name} 卸载失败，请手动执行：pip uninstall -y ${pkg_name}"
+                return 1
+            }
+        fi
+    fi
+
+    # 单独调用时显示详情并确认
+    if [[ -z "$skip_confirm" ]]; then
+        echo -e "${GREEN}── 安装 ${repo_name} ──${NC}"
+        log_info "目录：${install_dir} | 仓库：${ascend_repo} | 分支：${branch}"
+        confirm_to_continue || return 0
+    fi
+
+    ensure_dir "${install_dir}"
+
+    # 克隆/更新仓库
+    local repo_dir="${install_dir}/${repo_name}"
+    if [ -d "${repo_dir}" ]; then
+        log_info "${repo_name} 仓库已存在，更新中..."
+    else
+        log_info "正在克隆 ${repo_name} 仓库..."
+        if ! git clone "${ascend_repo}" "${repo_dir}"; then
+            log_error "克隆 ${repo_name} 仓库失败"
+            return 1
+        fi
+    fi
+
+    cd "${repo_dir}" || { log_error "无法进入仓库目录 ${repo_dir}"; return 1; }
+
+    # 切换分支
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if [ "${current_branch}" != "${branch}" ]; then
+        log_info "切换分支 ${current_branch} → ${branch}"
+        git fetch origin "${branch}" >/dev/null 2>&1 || true
+        if git checkout "${branch}" >/dev/null 2>&1; then
+            :
+        elif git checkout -b "${branch}" --track "origin/${branch}" >/dev/null 2>&1; then
+            :
+        else
+            log_warn "分支 ${branch} 不存在，请从已有分支中选择"
+            if ! select_valid_branch "${repo_dir}" "${repo_name}"; then
+                log_error "选择分支失败"
+                return 1
+            fi
+        fi
+    fi
+
+    # 安装
+    log_info "正在安装 ${repo_name} 包（可能耗时较长）..."
+    if pip install -v -e . -i https://pypi.tuna.tsinghua.edu.cn/simple; then
+        log_success "${repo_name} 包安装成功！"
+    else
+        log_fail "${repo_name} 包安装失败，请检查上述错误日志"
+        return 1
+    fi
+}
+
+# 一键安装 vllm + vllm-ascend（参数：安装目录）
+install_vllm_all() {
+    local install_dir="${1:-$DEFAULT_VLLM_INSTALL_DIR}"
+
+    echo -e "${GREEN}━━━ 一键安装 vllm + vllm-ascend ━━━${NC}"
+    log_info "目录：${install_dir} | vllm: ${DEFAULT_VLLM_BRANCH} | vllm-ascend: ${DEFAULT_VLLM_ASCEND_BRANCH}"
+    echo
+
+    echo -e "${GREEN}── [1/2] 安装 vllm ──${NC}"
+    install_vllm "${install_dir}" "$DEFAULT_VLLM_REPO" "$DEFAULT_VLLM_BRANCH" "skip_confirm" || {
+        log_fail "vllm 安装失败，终止一键安装"
+        return 1
+    }
+    echo
+
+    echo -e "${GREEN}── [2/2] 安装 vllm-ascend ──${NC}"
+    install_vllm_ascend "${install_dir}" "$DEFAULT_VLLM_ASCEND_REPO" "$DEFAULT_VLLM_ASCEND_BRANCH" "skip_confirm" || {
+        log_fail "vllm-ascend 安装失败，终止一键安装"
+        return 1
+    }
+    echo
+
+    log_success "vllm + vllm-ascend 一键安装完成！"
+}
+
+
+# ==================== 代理管理函数 ====================
+
+# 清除所有代理配置（临时环境变量 + ~/.bashrc + pip + git）
+clear_proxy() {
+    unset http_proxy https_proxy no_proxy GIT_SSL_NO_VERIFY 2>/dev/null || true
+
+    local BASHRC_FILE="$HOME/.bashrc"
+    sed -i '/# 自动配置的代理（由安装脚本添加）/,+5d' "$BASHRC_FILE" 2>/dev/null || true
+    rm -f "$HOME/.pip/pip.conf" 2>/dev/null || true
+    rm -f "/root/.gitconfig" 2>/dev/null || true
+
+    log_info "✅ 代理配置已清除（环境变量、~/.bashrc、pip、git）"
+    log_info "💡 若要立即让清理生效，执行: source ~/.bashrc"
+}
+
+# 静默设置代理（参数：可选IP、PORT），只设置环境变量 + .bashrc + pip.conf，不打印不测试
+setup_proxy_silent() {
+    local input_ip="${1:-$DEFAULT_PROXY_IP}"
+    local input_port="${2:-$DEFAULT_PROXY_PORT}"
+
+    input_ip=$(echo "${input_ip}" | xargs 2>/dev/null || true)
+    input_ip="${input_ip:-$DEFAULT_PROXY_IP}"
+    input_port=$(echo "${input_port}" | xargs 2>/dev/null || true)
+    input_port="${input_port:-$DEFAULT_PROXY_PORT}"
+
+    # 清理旧配置
+    unset http_proxy https_proxy no_proxy GIT_SSL_NO_VERIFY 2>/dev/null || true
+    local BASHRC_FILE="$HOME/.bashrc"
+    sed -i '/# 自动配置的代理（由安装脚本添加）/,+5d' "$BASHRC_FILE" 2>/dev/null || true
+    rm -f "$HOME/.pip/pip.conf" 2>/dev/null || true
+
+    # 设置临时环境变量
+    export http_proxy="http://p_atlas:proxy%40123@${input_ip}:${input_port}"
+    export https_proxy="http://p_atlas:proxy%40123@${input_ip}:${input_port}"
+    export no_proxy=127.0.0.1,.huawei.com,localhost,local,.local
+    export GIT_SSL_NO_VERIFY=1
+
+    # 写入 .bashrc
+    sed -i '/http_proxy=/d' "$BASHRC_FILE"
+    sed -i '/https_proxy=/d' "$BASHRC_FILE"
+    sed -i '/no_proxy=/d' "$BASHRC_FILE"
+    sed -i '/GIT_SSL_NO_VERIFY=/d' "$BASHRC_FILE"
+
+    echo -e "\n# 自动配置的代理（由安装脚本添加）" >> "$BASHRC_FILE"
+    echo "export http_proxy=\"http://p_atlas:proxy%40123@${input_ip}:${input_port}\"" >> "$BASHRC_FILE"
+    echo "export https_proxy=\"http://p_atlas:proxy%40123@${input_ip}:${input_port}\"" >> "$BASHRC_FILE"
+    echo "export no_proxy=\"127.0.0.1,.huawei.com,localhost,local,.local\"" >> "$BASHRC_FILE"
+    echo "export GIT_SSL_NO_VERIFY=1" >> "$BASHRC_FILE"
+
+    # 写入 pip 配置
+    mkdir -p "$HOME/.pip"
+    cat > "$HOME/.pip/pip.conf" << EOF
+[global]
+proxy = $http_proxy
+trusted-host = pypi.org
+               files.pythonhosted.org
+               pypi.python.org
+EOF
+}
+
+# 确保网络连通：直连 → 默认代理 → 交互配置
+ensure_network() {
+    # 1. 直连测试
+    log_info "正在检查网络连通性..."
+    if curl -s --connect-timeout 1 http://www.baidu.com > /dev/null 2>&1; then
+        log_info "✅ 网络连接正常（直连）"
+        return 0
+    fi
+
+    # 2. 尝试用默认代理
+    log_info "直连不通，尝试代理 $DEFAULT_PROXY_IP:$DEFAULT_PROXY_PORT ..."
+    if [ -z "$http_proxy" ]; then
+        setup_proxy_silent
+    fi
+    if curl -s --connect-timeout 1 --proxy "$http_proxy" http://www.baidu.com > /dev/null 2>&1; then
+        log_info "✅ 代理已自动配置并连通 ($DEFAULT_PROXY_IP:$DEFAULT_PROXY_PORT)"
+        return 0
+    fi
+
+    # 3. 默认代理不通，TUI 选择
+    local net_cursor=0
+    local net_n=3
+    local net_key net_i net_desc
+    tput civis 2>/dev/null
+
+    while true; do
+        clear
+        echo "=================================="
+        echo -e "  ${RED}⚠️ 默认代理 ($DEFAULT_PROXY_IP:$DEFAULT_PROXY_PORT) 连接失败${NC}"
+        echo "=================================="
+        for ((net_i=0; net_i<net_n; net_i++)); do
+            case $net_i in
+                0) net_desc="输入新的代理 IP 和 PORT" ;;
+                1) net_desc="修改脚本默认配置后重启" ;;
+                2) net_desc="取消当前操作" ;;
+            esac
+            if [ $net_i -eq $net_cursor ]; then
+                echo -e "\e[7m  $((net_i+1)). ${net_desc}\e[0m"
+            else
+                echo -e "  $((net_i+1)). ${net_desc}"
+            fi
+        done
+        echo "=================================="
+        echo -e "  ${YELLOW}↑↓ 移动 | Enter 确认${NC}"
+        echo -e "  ${YELLOW}提示: 选项1仅当前终端生效，永久生效需修改脚本默认配置${NC}"
+
+        IFS= read -rsn1 net_key
+        if [[ "$net_key" == $'\x1b' ]]; then
+            IFS= read -rsn2 -t 0.1 net_key
+            if [[ "$net_key" == "[A" ]]; then
+                ((net_cursor--)); [ $net_cursor -lt 0 ] && net_cursor=$((net_n-1))
+            elif [[ "$net_key" == "[B" ]]; then
+                ((net_cursor++)); [ $net_cursor -ge $net_n ] && net_cursor=0
+            fi
+            continue
+        fi
+        [[ "$net_key" == "" ]] && break
+    done
+
+    tput cnorm 2>/dev/null
+
+    case $((net_cursor + 1)) in
+        1)
+            local user_ip user_port
+            read -e -p "代理IP: " user_ip
+            read -e -p "代理PORT: " user_port
+            # 覆写默认代理变量，后续菜单配置显示和 setup_proxy_silent 都用新值
+            DEFAULT_PROXY_IP="${user_ip:-$DEFAULT_PROXY_IP}"
+            DEFAULT_PROXY_PORT="${user_port:-$DEFAULT_PROXY_PORT}"
+            setup_proxy_silent "$DEFAULT_PROXY_IP" "$DEFAULT_PROXY_PORT"
+            if curl -s --connect-timeout 10 --proxy "$http_proxy" http://www.baidu.com > /dev/null 2>&1; then
+                log_info "✅ 代理配置成功"
+                return 0
+            else
+                log_error "代理仍然不通，请手动确认连通性后修改脚本顶部的 DEFAULT_PROXY_IP 和 DEFAULT_PROXY_PORT 并重新运行脚本"
+                return 1
+            fi
+            ;;
+        2)
+            log_info "请修改脚本顶部的 DEFAULT_PROXY_IP 和 DEFAULT_PROXY_PORT 后重新运行"
+            return 1
+            ;;
+        3)
+            log_info "已取消"
+            return 1
+            ;;
+    esac
+}
+
+# ==================== Docker / 进程管理函数 ====================
+
+# 创建挂载 Ascend NPU 设备的 vllm Docker 容器
+create_vllm_container() {
+    echo -e "${GREEN}── 创建 vllm 容器 ──${NC}"
+    check_command docker
+
+    echo -e "\n${YELLOW}[INFO] 本地可用镜像列表（ID: 仓库:标签）：${NC}"
+    local local_images
+    local_images=$(docker images --format "{{.ID}}: {{.Repository}}:{{.Tag}}" | grep -v "<none>:<none>" || true)
+    if [ -n "$local_images" ]; then
+        echo "$local_images" | while read -r img; do
+            echo "  - $img"
+        done
+    else
+        log_warn "本地未检测到有效镜像，将使用默认镜像ID"
+    fi
+
+    local selected_image
+    while true; do
+        read -e -p "请输入要使用的镜像ID [默认: $DEFAULT_IMAGE_ID]: " selected_image
+        selected_image=$(echo "${selected_image}" | xargs || true)
+        selected_image=${selected_image:-$DEFAULT_IMAGE_ID}
+
+        if docker images -q "$selected_image" >/dev/null 2>&1; then
+            log_info "选择的镜像ID有效：$selected_image"
+            break
+        else
+            log_error "镜像ID $selected_image 本地不存在，请重新输入！"
+            if [ -n "$local_images" ]; then
+                echo -e "${YELLOW}本地可用镜像ID参考：${NC}"
+                docker images --format "{{.ID}}" | grep -v "<none>" | while read -r img_id; do
+                    echo "  - $img_id"
+                done
+            fi
+        fi
+    done
+
+    local selected_container
+    while true; do
+        read -e -p "请输入要创建的容器名 [默认: $DEFAULT_CONTAINER_NAME]: " selected_container
+        selected_container=$(echo "${selected_container}" | xargs || true)
+        selected_container=${selected_container:-$DEFAULT_CONTAINER_NAME}
+
+        local exist_container
+        exist_container=$(docker ps -a --filter "name=^/${selected_container}$" -q)
+        if [ -n "$exist_container" ]; then
+            log_error "容器名 $selected_container 已存在（运行/停止状态），请更换名称！"
+            echo -e "${YELLOW}当前本地已存在的容器名列表：${NC}"
+            docker ps -a --format "{{.Names}}" | sort | while read -r name; do
+                echo "  - $name"
+            done
+        else
+            log_info "选择的容器名有效：$selected_container"
+            break
+        fi
+    done
+
+    echo -e "\n${GREEN}开始执行容器创建命令，耗时约数秒...${NC}"
+    docker run --name "${selected_container}" -it -d --net=host --shm-size=500g \
+           --privileged=true \
+           -w /home \
+           --device=/dev/davinci_manager \
+           --device=/dev/hisi_hdc \
+           --device=/dev/devmm_svm \
+           --entrypoint=bash \
+           -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+           -v /usr/local/dcmi:/usr/local/dcmi \
+           -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+           -v /usr/local/sbin:/usr/local/sbin \
+           -v /home:/home \
+           -v /tmp:/tmp \
+           -v /data:/data \
+           -v /mnt/:/mnt/ \
+           -v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+           -v /etc/hccn.conf:/etc/hccn.conf \
+           -e http_proxy="${http_proxy:-}" \
+           -e https_proxy="${https_proxy:-}" \
+           "${selected_image}"
+
+    if docker ps -a --filter "name=^/${selected_container}$" -q >/dev/null 2>&1; then
+        log_info "✅ 容器 ${selected_container} 创建成功！"
+        log_info "容器状态查询：docker ps -a | grep ${selected_container}"
+        log_info "进入容器命令：docker exec -it ${selected_container} bash"
+
+        local enter_container_flag
+        while true; do
+            read -e -p "是否立即进入该容器？(y/n，默认n)：" enter_container_flag
+            enter_container_flag=$(echo "${enter_container_flag}" | xargs || echo "n")
+
+            if [[ "${enter_container_flag}" =~ ^[YyNn]$ ]] || [ -z "${enter_container_flag}" ]; then
+                enter_container_flag=${enter_container_flag:-n}
+                enter_container_flag=$(echo "${enter_container_flag}" | tr 'A-Z' 'a-z')
+                break
+            else
+                log_error "输入无效！请输入 y 或 n（直接回车默认 n）"
+            fi
+        done
+
+        if [ "${enter_container_flag}" = "y" ]; then
+            log_info "正在进入容器 ${selected_container} ..."
+            log_info "进入容器后需要重新执行本脚本以进行后续安装操作 ..."
+            docker exec -it "${selected_container}" bash
+            echo -e "${GREEN}✅ 已成功退出容器 ${selected_container}，回到宿主机环境！${NC}"
+        else
+            log_info "已选择不立即进入容器，可后续执行上述命令手动进入"
+        fi
+
+    else
+        log_error "❌ 容器 ${selected_container} 创建失败，请检查docker命令输出！"
+        return 1
+    fi
+    echo "=================================="
+}
+
+# 强制查杀所有 python/torchrun/ray/vllm 相关进程
+kill_all_related_process() {
+    echo -e "${RED}── 万能杀 ──${NC}"
+    log_info "1. 查杀python相关进程"
+    ps -ef | grep "python"| grep -v grep | awk '{print $2}' | xargs -t -i kill -9 {} 2>/dev/null || true
+    pkill -9 python 2>/dev/null || true
+
+    log_info "2. 查杀torchrun相关进程"
+    pkill -9 torchrun 2>/dev/null || true
+
+    log_info "3. 停止ray服务"
+    ray stop 2>/dev/null || true
+
+    log_info "4. 查杀python/defunct僵尸进程（父进程）"
+    ps -ef | grep "defunct"|grep python| awk '{print $3}'|xargs -t -i kill -9 {} 2>/dev/null || true
+
+    log_info "5. 查杀torchrun/defunct僵尸进程（父进程）"
+    ps -ef | grep "defunct"|grep torchrun| awk '{print $3}'|xargs -t -i kill -9 {} 2>/dev/null || true
+
+    log_info "6. 查杀VLLM进程"
+    pkill -9 VLLM* 2>/dev/null || true
+
+    echo -e "\n✅ ${GREEN}万能杀执行完成！所有相关进程已强制查杀${NC}"
+    echo "=================================="
+}
+
+# 一键停止所有运行中的 Docker 容器
+stop_all_containers() {
+    echo -e "${YELLOW}── 停止所有运行中容器 ──${NC}"
+    check_command docker
+
+    local running_containers
+    running_containers=$(timeout 5 docker ps -q 2>/dev/null)
+
+    if [ -z "$running_containers" ]; then
+        log_info "✅ 本地无运行中的Docker容器/或Docker操作超时，无需停止"
+        return 0
+    fi
+
+    local stop_container_list
+    stop_container_list=$(timeout 5 docker ps --format "{{.ID}}::{{.Names}}" 2>/dev/null)
+    if [ -z "$stop_container_list" ]; then
+        stop_container_list=$(echo "$running_containers" | awk '{print $0 "::未知名称"}')
+        log_warn "⚠️  容器名称查询超时，将按容器ID处理"
+    fi
+
+    log_info "检测到以下运行中的容器，即将停止："
+    timeout 5 docker ps --format "  - 容器名: {{.Names}} | 容器ID: {{.ID}} | 镜像: {{.Image}}" 2>/dev/null || log_warn "⚠️  容器信息查询超时，将直接批量处理容器ID"
+    echo
+
+    local confirm_flag
+    while true; do
+        read -e -p "确认是否停止以上所有运行中容器？(y/n，默认n)：" confirm_flag
+        confirm_flag=$(echo "${confirm_flag}" | xargs || echo "n")
+        confirm_flag=${confirm_flag:-n}
+        confirm_flag=$(echo "${confirm_flag}" | tr 'A-Z' 'a-z')
+
+        if [[ "${confirm_flag}" =~ ^[YyNn]$ ]]; then
+            break
+        else
+            log_error "输入无效！请输入 y 或 n（直接回车默认 n）"
+        fi
+    done
+
+    if [ "${confirm_flag}" = "y" ]; then
+        log_info "开始停止所有运行中容器（5秒全局超时，超时直接跳过）..."
+        timeout 5 docker stop -t 5 $(docker ps -q) 2>/dev/null
+        timeout 5 docker kill $(docker ps -q) 2>/dev/null || true
+
+        local remaining_containers
+        remaining_containers=$(timeout 5 docker ps -q 2>/dev/null)
+
+        local not_stopped_containers=""
+        if [ -n "$remaining_containers" ] && [ -n "$stop_container_list" ]; then
+            while IFS="::" read -r cid cname; do
+                if echo "$remaining_containers" | grep -qw "$cid"; then
+                    not_stopped_containers+="  - 容器名: $cname | 容器ID: $cid\n"
+                fi
+            done <<< "$stop_container_list"
+        fi
+
+        if [ -z "$remaining_containers" ]; then
+            log_info "✅ 所有运行中容器已成功停止！"
+            timeout 5 docker ps -a --format "  - {{.Names}} [{{.Status}}]" 2>/dev/null || true
+        else
+            log_error "❌ 存在容器超时未停止（已跳过卡顿操作），请手动处理！"
+            if [ -n "$not_stopped_containers" ]; then
+                echo -e "${not_stopped_containers}"
+            else
+                echo "  - 未停止容器ID列表：$remaining_containers"
+            fi
+        fi
+    else
+        log_info "已取消停止容器操作，无任何变更"
+    fi
+    echo "=================================="
+}
+
+# 查询 NPU 卡上正在运行的进程及其工作目录
+check_npu_occupancy() {
+    echo "=================================="
+    echo -e "${YELLOW}查看NPU占用者（进程号+工作目录）${NC}"
+    echo "=================================="
+    check_command npu-smi info
+    check_command pwdx
+
+    log_info "正在执行npu-smi info获取NPU进程原始数据..."
+    local npu_smi_raw
+    npu_smi_raw=$(npu-smi info 2>/dev/null | grep -v "^$")
+
+    local process_area
+    process_area=$(echo "$npu_smi_raw" | awk '
+        /Process id/ {flag=1; next}  # 匹配Process id标题，开启进程区解析
+        flag { print }              # 进程区内的所有行全部保留并打印
+    ' | grep -v "^$")
+
+    echo -e "\n${36}[DEBUG] npu-smi info进程区原始内容：${NC}"
+    echo -e "${36}$process_area${NC}"
+    echo "----------------------------------"
+
+    local pids
+    pids=$(echo "$process_area" | grep -oE '[0-9]{4,}' | sort -u | uniq)
+
+    if [ -z "$pids" ]; then
+        log_info "${RED}❌ 未检测到NPU上有运行中的进程！${NC}"
+        echo "=================================="
+        return 0
+    fi
+
+    local pid_count=$(echo "$pids" | wc -w)
+    log_info "✅ 成功提取到 $pid_count 个有效NPU进程号，正在查询工作目录（pwdx）..."
+    echo -e "\n${GREEN}========== NPU占用进程详情 ==========${NC}"
+    echo -e "${GREEN}PID\t| 工作目录/使用者路径${NC}"
+    echo "----------------------------------"
+    for pid in $pids; do
+        local pwdx_result
+        pwdx_result=$(pwdx "$pid" 2>/dev/null | awk -F': ' '{print $2}')
+        if [ -n "$pwdx_result" ]; then
+            echo -e "${YELLOW}$pid${NC}\t| $pwdx_result"
+        else
+            echo -e "${YELLOW}$pid${NC}\t| ${RED}进程已退出/无权限查看目录${NC}"
+        fi
+    done
+    echo "----------------------------------"
+    log_info "✅ NPU占用者查询完成！"
+    echo "=================================="
+    return 0
+}
+
+# ==================== Claude Code 安装函数 ====================
+
+# 安装 Claude Code CLI（Node.js + npm，含多源回退）
+install_claude_code() {
+    local install_dir="${1:-$DEFAULT_CLAUDE_CODE_INSTALL_DIR}"
+
+    echo -e "${GREEN}── 安装 Claude Code ──${NC}"
+
+    # 默认值
+    local NODE_VERSION="${DEFAULT_NODE_VERSION}"
+    local NODE_ARCH="${DEFAULT_NODE_ARCH}"
+    local NODE_FILENAME="node-${NODE_VERSION}-${NODE_ARCH}.tar.gz"
+    local NODE_DOWNLOAD_URL="${DEFAULT_NODE_MIRROR_BASE}/${NODE_VERSION}/${NODE_FILENAME}"
+    local NPM_REGISTRY="${DEFAULT_NPM_REGISTRY}"
+    # 获取工作目录
+    local work_dir="${install_dir}"
+    local node_env_dir="${work_dir}/claude_code_env"
+    local node_archive_path="${node_env_dir}/${NODE_FILENAME}"
+    local node_extract_dir="${node_env_dir}/node-${NODE_VERSION}-${NODE_ARCH}"
+    local node_bin_dir="${node_extract_dir}/bin"
+
+    ensure_dir "${node_env_dir}"
+
+    # 打印安装配置
+    log_info "目录：${work_dir} | Node：${NODE_VERSION} (${NODE_ARCH}) | npm 源：${NPM_REGISTRY}"
+
+    local confirm_install
+    while true; do
+        read -e -p "确认开始安装？(y/n，默认y)：" confirm_install
+        confirm_install=$(echo "${confirm_install}" | xargs || echo "y")
+        confirm_install=${confirm_install:-y}
+        confirm_install=$(echo "${confirm_install}" | tr 'A-Z' 'a-z')
+        if [[ "${confirm_install}" =~ ^[YyNn]$ ]]; then
+            break
+        else
+            log_error "输入无效！请输入 y 或 n"
+        fi
+    done
+
+    if [ "${confirm_install}" != "y" ]; then
+        log_info "已取消安装"
+        return 0
+    fi
+
+    # ===== Step 1/4: 下载 Node.js =====
+    echo -e "\n${GREEN}── [1/5] 下载 Node.js ──${NC}"
+
+    if [ -f "${node_archive_path}" ]; then
+        log_info "Node.js 压缩包已存在：${node_archive_path}"
+    else
+        log_info "正在下载 Node.js ${NODE_VERSION}..."
+
+        if wget --no-check-certificate -O "${node_archive_path}" "${NODE_DOWNLOAD_URL}"; then
+            log_success "Node.js 下载成功"
+        else
+            log_fail "Node.js 下载失败"
+            rm -f "${node_archive_path}"
+            return 1
+        fi
+    fi
+
+    # ===== Step 2/4: 解压 Node.js + 配置环境变量 =====
+    echo -e "\n${GREEN}── [2/5] 解压 Node.js 并配置环境变量 ──${NC}"
+
+    if [ -d "${node_extract_dir}" ]; then
+        log_info "Node.js 已解压，跳过"
+    else
+        log_info "正在解压 Node.js..."
+        tar -xf "${node_archive_path}" -C "${node_env_dir}"
+        if [ $? -eq 0 ]; then
+            log_success "Node.js 解压成功"
+        else
+            log_fail "Node.js 解压失败"
+            return 1
+        fi
+    fi
+
+    # 配置环境变量（持久化 + 当前会话）
+    sed -i '/# Claude Code 环境变量（由安装脚本添加）/,+3d' ~/.bashrc 2>/dev/null || true
+    echo -e "\n# Claude Code 环境变量（由安装脚本添加）" >> ~/.bashrc
+    echo "export PATH=${node_bin_dir}:\$PATH" >> ~/.bashrc
+    echo "export NODE_TLS_REJECT_UNAUTHORIZED=0" >> ~/.bashrc
+    echo "export IS_SANDBOX=1" >> ~/.bashrc
+
+    export PATH=${node_bin_dir}:$PATH
+    export NODE_TLS_REJECT_UNAUTHORIZED=0
+    export IS_SANDBOX=1
+
+    if node -v > /dev/null 2>&1; then
+        log_success "Node.js $(node -v) / npm $(npm -v)"
+    else
+        log_error "❌ Node.js 验证失败，检查 PATH 设置"
+        log_info "Node.js 路径: ${node_bin_dir}"
+        ls -la "${node_bin_dir}/" 2>/dev/null || log_error "目录不存在: ${node_bin_dir}"
+        return 1
+    fi
+
+    # ===== Step 3/4: 安装 Claude Code =====
+    echo -e "\n${GREEN}── [3/5] 安装 Claude Code ──${NC}"
+
+    log_info "配置 npm 镜像源..."
+    npm config set strict-ssl false
+    npm config set registry "${NPM_REGISTRY}"
+    npm cache clean -f 2>/dev/null || true
+
+    log_info "正在安装 Claude Code（可能耗时 30-60 秒）..."
+
+    if npm install -g "@anthropic-ai/claude-code" --verbose; then
+        log_success "Claude Code 安装成功（$(claude -v 2>/dev/null || echo 'unknown')）"
+    else
+        log_warn "⚠️ 淘宝源安装失败，尝试切换腾讯云源..."
+        npm config set registry "http://mirrors.cloud.tencent.com/npm/"
+        if npm install -g "@anthropic-ai/claude-code" --verbose; then
+            log_success "Claude Code 安装成功（腾讯云源）"
+        else
+            log_warn "⚠️ 腾讯云源也失败，尝试华为云源..."
+            npm config set registry "https://mirrors.huaweicloud.com/repository/npm/"
+            if npm install -g "@anthropic-ai/claude-code" --verbose; then
+                log_success "Claude Code 安装成功（华为云源）"
+            else
+                log_fail "Claude Code 安装失败，请检查网络或手动安装"
+                return 1
+            fi
+        fi
+    fi
+
+    # 验证 claude
+    if command -v claude &> /dev/null; then
+        log_info "Claude Code 版本: $(claude -v)"
+    else
+        log_warn "⚠️ claude 命令未在 PATH 中找到，尝试全路径验证..."
+        if [ -f "${node_bin_dir}/claude" ]; then
+            log_info "Claude Code 版本: $(${node_bin_dir}/claude -v)"
+        else
+            log_warn "claude 可执行文件未找到，请检查安装"
+        fi
+    fi
+
+    # ===== Step 4/5: 配置状态栏脚本 statusline.py =====
+    echo -e "\n${GREEN}── [4/5] 配置状态栏脚本 statusline.py ──${NC}"
+
+    mkdir -p ~/.claude
+    local STATUSLINE_SRC="${SCRIPT_DIR}/statusline.py"
+    if [ -f "${STATUSLINE_SRC}" ]; then
+        cp "${STATUSLINE_SRC}" ~/.claude/statusline.py
+        chmod +x ~/.claude/statusline.py
+        log_info "状态栏脚本已从 ${STATUSLINE_SRC} 复制到 ~/.claude/statusline.py"
+    else
+        log_warn "未找到 ${STATUSLINE_SRC}，跳过状态栏安装(请确认仓库文件完整)"
+    fi
+
+    # ===== Step 5/5: 配置 settings.json =====
+    echo -e "\n${GREEN}── [5/5] 配置 Claude Code settings.json ──${NC}"
+
+    # 检测 python3 绝对路径, 写入 statusLine command, 保证跨机器可用
+    local CLAUDE_PYTHON
+    CLAUDE_PYTHON="$(command -v python3 || command -v python)"
+    if [ -z "${CLAUDE_PYTHON}" ]; then
+        log_warn "未找到 python3，状态栏将回退使用 python3（请确保运行时 PATH 可用）"
+        CLAUDE_PYTHON="python3"
+    fi
+
+    cat > ~/.claude/settings.json << EOF
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.2[1m]",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2[1m]",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.2[1m]",
+    "ANTHROPIC_API_KEY": "YOUR_API_KEY_HERE",
+    "API_TIMEOUT_MS": "3000000",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
+  },
+  "outputStyle": "engineer-professional",
+  "skipDangerousModePermissionPrompt": true,
+  "statusLine": {
+    "type": "command",
+    "command": "${CLAUDE_PYTHON} ${HOME}/.claude/statusline.py"
+  }
+}
+EOF
+    log_info "settings.json 已写入 ~/.claude/settings.json"
+    log_warn "请修改 ~/.claude/settings.json 中的 ANTHROPIC_API_KEY 为你实际的 API Key"
+    echo -e "${YELLOW}当前配置（API Key 已用占位符代替）:${NC}"
+    cat ~/.claude/settings.json
+
+    # ===== 汇总 =====
+    echo
+    log_success "Claude Code 安装完成"
+    log_info "Node.js: $(node -v) | npm: $(npm -v) | Claude Code: $(claude -v 2>/dev/null || echo 'unavailable')"
+
+    # ===== 可选：配置终端桌宠 (CodeNoNo) =====
+    if ask_pet_install; then
+        install_clawd_pet
+    else
+        log_info "已跳过终端桌宠配置（之后可手动重跑本步或 bash ~/.claude/pet/start.sh）"
+    fi
+}
+
+# ==================== 终端桌宠 (clawd-term / CodeNoNo) ====================
+
+# 安装终端桌宠：tmux + Pillow + 脚本 + CodeNoNo 精灵图 + 注册 Claude Code hooks
+install_clawd_pet() {
+    echo -e "\n${GREEN}── 配置终端桌宠 (clawd-term · CodeNoNo) ──${NC}"
+    local PET_DIR="${HOME}/.claude/pet"
+    local SRC_DIR="${SCRIPT_DIR}/clawd-term"
+    if [ -z "${SCRIPT_DIR:-}" ]; then
+        SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-"$0"}")" 2>/dev/null && pwd)/clawd-term"
+    fi
+
+    # 1) 依赖：tmux / python3 / Pillow
+    command -v tmux >/dev/null 2>&1 || {
+        log_info "安装 tmux ..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -o Acquire::Retries=8 --no-install-recommends tmux >/dev/null 2>&1 \
+            || { log_warn "tmux 安装失败，请手动 apt-get install tmux"; return 1; }
+    }
+    command -v python3 >/dev/null 2>&1 || { log_warn "缺少 python3"; return 1; }
+    python3 -c "from PIL import Image" 2>/dev/null || {
+        log_info "安装 Pillow ..."
+        pip3 install -q -i https://pypi.tuna.tsinghua.edu.cn/simple pillow >/dev/null 2>&1 \
+            || { log_warn "Pillow 安装失败，请手动 pip3 install pillow"; return 1; }
+    }
+
+    # 2) 拷贝桌宠脚本
+    mkdir -p "$PET_DIR"
+    if [ -d "$SRC_DIR" ]; then
+        cp -f "$SRC_DIR"/pet.py "$SRC_DIR"/hook.sh "$SRC_DIR"/start.sh "$SRC_DIR"/merge_hooks.py "$PET_DIR/" 2>/dev/null
+        chmod +x "$PET_DIR"/pet.py "$PET_DIR"/hook.sh "$PET_DIR"/start.sh 2>/dev/null
+        log_info "桌宠脚本 -> ${PET_DIR}"
+    else
+        log_warn "未找到 ${SRC_DIR}（伴生 clawd-term/ 缺失），脚本拷贝跳过"
+    fi
+
+    # 3) 精灵图：codenono / bubu / yier -> ~/.claude/pet/<name>.webp（仓库自带 > 本地 awesome-codex-pet）
+    local name DST DEV_P
+    for name in codenono bubu yier; do
+        DST="$PET_DIR/$name.webp"
+        case "$name" in
+            codenono) DEV_P="/home/l00889328/dev/awesome-codex-pet/pets/codenono--dq02/spritesheet.webp" ;;
+            bubu)     DEV_P="/home/l00889328/dev/awesome-codex-pet/pets/bubu--gbn666/spritesheet.webp" ;;
+            yier)     DEV_P="/home/l00889328/dev/awesome-codex-pet/pets/yier--gbn666/spritesheet.webp" ;;
+        esac
+        if [ -f "$DST" ]; then
+            :
+        elif [ -f "$SRC_DIR/$name.webp" ]; then
+            cp -f "$SRC_DIR/$name.webp" "$DST"; log_info "精灵图 $name <- 仓库自带"
+        elif [ -f "$DEV_P" ]; then
+            cp -f "$DEV_P" "$DST"; log_info "精灵图 $name <- 本地 awesome-codex-pet"
+        else
+            log_warn "缺 $name.webp（可手动放到 $DST）"
+        fi
+    done
+
+    # 4) 注册 Claude Code hooks（幂等，自动备份 settings.json.bak-pet）
+    if [ -f "$PET_DIR/merge_hooks.py" ] && [ -f "${HOME}/.claude/settings.json" ]; then
+        python3 "$PET_DIR/merge_hooks.py" >/dev/null 2>&1 \
+            && log_info "hooks 已写入 ~/.claude/settings.json" \
+            || log_warn "hooks 注册失败，可手动 python3 $PET_DIR/merge_hooks.py"
+    fi
+
+    echo
+    log_success "终端桌宠配置完成"
+    echo -e "  启动：${GREEN}bash ~/.claude/pet/start.sh col${NC}  （右侧窄列）"
+    echo -e "       ${GREEN}bash ~/.claude/pet/start.sh${NC}       （底部窄条，最省地）"
+    echo -e "  进入 tmux 后在主窗格运行 ${GREEN}claude${NC}，桌宠随状态动；分离 Ctrl+B D。"
+    echo -e "  清晰度/尺寸：编辑 ${YELLOW}~/.claude/pet/pet.py${NC} 顶部 ${YELLOW}PET_W${NC}（默认 40）。"
+    echo -e "  换桌宠形象：${GREEN}PET_PET=bubu${NC}（或 ${GREEN}yier${NC} / codenono）bash ~/.claude/pet/start.sh col"
+    echo -e "  翻看 claude 历史：经典模式滚轮/PgUp 翻不了——用 ${GREEN}/tui fullscreen${NC} 后 ${GREEN}PgUp/PgDn${NC}，或按 ${GREEN}Ctrl+O${NC} 进 transcript 审阅。"
+}
+
+# TUI 二选一：是否配置终端桌宠。返回 0=配置，1=跳过（↑↓ 选择，Enter 确认）
+ask_pet_install() {
+    local cursor=0 key
+    local items=("配置终端桌宠 (CodeNoNo) —— tmux 窗格里随 Claude Code 状态动的桌面宠物" "跳过（之后可手动配置）")
+    tput civis 2>/dev/null
+    while true; do
+        clear
+        echo -e "${GREEN}========================================${NC}"
+        echo -e "${GREEN}  可选：是否配置终端桌宠？${NC}"
+        echo -e "${GREEN}========================================${NC}"
+        for i in 0 1; do
+            if [ "$i" -eq "$cursor" ]; then
+                echo -e "\e[7m> ${items[$i]}\e[0m"
+            else
+                echo -e "  ${items[$i]}"
+            fi
+        done
+        echo -e "${YELLOW}  ↑↓ 选择，Enter 确认${NC}"
+        IFS= read -rsn1 key
+        if [[ "$key" == $'\x1b' ]]; then
+            IFS= read -rsn2 -t 0.1 key
+            [[ "$key" == "[A" ]] && cursor=$(( (cursor - 1 + 2) % 2 ))
+            [[ "$key" == "[B" ]] && cursor=$(( (cursor + 1) % 2 ))
+            continue
+        fi
+        [[ "$key" == "" ]] && break
+    done
+    tput cnorm 2>/dev/null
+    [ "$cursor" -eq 0 ]
+}
+
+# ==================== 菜单与主入口 ====================
+
+# TUI 多选菜单（上下键导航，空格/x 多选，回车确认）
+show_tui_menu() {
+    local n=10
+    local cursor=0
+    local i key mark
+
+    # 选项列表
+    local opt1="安装vllm"
+    local opt2="安装vllm-ascend"
+    local opt3="一键安装vllm+vllm-ascend"
+    local opt4="创建vllm容器"
+    local opt5="万能杀"
+    local opt6="停止所有运行容器"
+    local opt7="看看谁在用卡"
+    local opt8="安装 Claude Code"
+    local opt9="清除代理"
+    local opt10="退出"
+
+    # 选中状态（全局数组，0=未选 1=已选）
+    _TUI_CHK=(0 0 0 0 0 0 0 0 0)
+
+    tput civis 2>/dev/null  # 隐藏光标
+
+    while true; do
+        # 清屏重绘
+        clear
+        echo "=================================="
+        echo -e "  ${GREEN}HyperScript 一键安装脚本${NC}"
+        echo "=================================="
+        echo -e "  ${YELLOW}当前默认配置（修改脚本顶部 DEFAULT_* 变量可调整）${NC}"
+        printf "  ${GREEN}%-15s${NC} %s\n" "[代理]" "$DEFAULT_PROXY_IP:$DEFAULT_PROXY_PORT"
+        printf "  ${GREEN}%-15s${NC} 分支 %s | 仓库 %s | 目录 %s\n" "[vllm]" "$DEFAULT_VLLM_BRANCH" "$DEFAULT_VLLM_REPO" "$DEFAULT_VLLM_INSTALL_DIR"
+        printf "  ${GREEN}%-15s${NC} 分支 %s | 仓库 %s | 目录 %s\n" "[vllm-ascend]" "$DEFAULT_VLLM_ASCEND_BRANCH" "$DEFAULT_VLLM_ASCEND_REPO" "$DEFAULT_VLLM_ASCEND_INSTALL_DIR"
+        printf "  ${GREEN}%-15s${NC} Node %s | npm %s | 目录 %s\n" "[Claude Code]" "$DEFAULT_NODE_VERSION ($DEFAULT_NODE_ARCH)" "$DEFAULT_NPM_REGISTRY" "$DEFAULT_CLAUDE_CODE_INSTALL_DIR"
+        printf "  ${GREEN}%-15s${NC} 容器 %s | 镜像 %s ${YELLOW}(创建新容器时的默认配置)${NC}\n" "[Docker]" "$DEFAULT_CONTAINER_NAME" "$DEFAULT_IMAGE_ID"
+        echo "----------------------------------"
+        for ((i=0; i<n; i++)); do
+            case $i in
+                0) desc="$opt1" ;; 1) desc="$opt2" ;; 2) desc="$opt3" ;;
+                3) desc="$opt4" ;; 4) desc="$opt5" ;; 5) desc="$opt6" ;;
+                6) desc="$opt7" ;; 7) desc="$opt8" ;; 8) desc="$opt9" ;;
+                9) desc="$opt10" ;;
+            esac
+            if [ "${_TUI_CHK[$i]}" = "1" ]; then
+                mark="✓"
+            else
+                mark=" "
+            fi
+            if [ $i -eq $cursor ]; then
+                printf "\e[7m  [%s] %d. %s\e[0m\n" "$mark" "$((i+1))" "$desc"
+            else
+                printf "  [%s] %d. %s\n" "$mark" "$((i+1))" "$desc"
+            fi
+        done
+        echo "=================================="
+        echo -e "  ${YELLOW}↑↓ 移动 | 空格/x 选择 | Enter 确认 | a 全选 | q 退出${NC}"
+
+        # 读取按键
+        IFS= read -rsn1 key
+
+        # 方向键：ESC [ A / ESC [ B
+        if [[ "$key" == $'\x1b' ]]; then
+            IFS= read -rsn2 -t 0.1 key
+            if [[ "$key" == "[A" ]]; then
+                ((cursor--)); [ $cursor -lt 0 ] && cursor=$((n-1))
+            elif [[ "$key" == "[B" ]]; then
+                ((cursor++)); [ $cursor -ge $n ] && cursor=0
+            fi
+            continue
+        fi
+
+        # 空格 或 x：切换选中
+        if [[ "$key" == " " ]] || [[ "$key" == "x" ]]; then
+            if [ "${_TUI_CHK[$cursor]}" = "1" ]; then
+                _TUI_CHK[$cursor]=0
+            else
+                _TUI_CHK[$cursor]=1
+            fi
+            continue
+        fi
+
+        # Enter：确认
+        if [[ "$key" == "" ]]; then
+            break
+        fi
+
+        # a：全选（不含退出）
+        if [[ "$key" == "a" ]]; then
+            for ((i=0; i<n-1; i++)); do _TUI_CHK[$i]=1; done
+            continue
+        fi
+
+        # q：退出
+        if [[ "$key" == "q" ]]; then
+            tput cnorm 2>/dev/null
+            log_info "退出脚本"
+            exit 0
+        fi
+    done
+
+    tput cnorm 2>/dev/null  # 恢复光标
+
+    # 输出选中项到全局数组
+    TUI_SELECTED=()
+    for ((i=0; i<n; i++)); do
+        [ "${_TUI_CHK[$i]}" = "1" ] && TUI_SELECTED+=($((i+1)))
+    done
+}
+
+# 主入口：环境检查 + 菜单循环
+main() {
+    check_command python3
+    check_command pip
+    check_command rm
+    check_command cp
+    check_command curl
+
+    # 启动时检查网络连通性（配置信息已在菜单头部显示）
+    ensure_network || exit 1
+
+    while true; do
+        show_tui_menu
+
+        # 未选择任何项，重新显示菜单
+        [ ${#TUI_SELECTED[@]} -eq 0 ] && continue
+
+        for opt in "${TUI_SELECTED[@]}"; do
+            case $opt in
+                1)
+                    install_vllm "$DEFAULT_VLLM_INSTALL_DIR" "$DEFAULT_VLLM_REPO" "$DEFAULT_VLLM_BRANCH"
+                    ;;
+                2)
+                    install_vllm_ascend "$DEFAULT_VLLM_ASCEND_INSTALL_DIR" "$DEFAULT_VLLM_ASCEND_REPO" "$DEFAULT_VLLM_ASCEND_BRANCH"
+                    ;;
+                3)
+                    install_vllm_all "$DEFAULT_VLLM_INSTALL_DIR"
+                    ;;
+                4)
+                    create_vllm_container
+                    ;;
+                5)
+                    kill_all_related_process
+                    ;;
+                6)
+                    stop_all_containers
+                    ;;
+                7)
+                    check_npu_occupancy
+                    ;;
+                8)
+                    install_claude_code "$DEFAULT_CLAUDE_CODE_INSTALL_DIR"
+                    ;;
+                9)
+                    clear_proxy
+                    ;;
+                10)
+                    log_info "退出脚本"
+                    exit 0
+                    ;;
+            esac
+        done
+
+        echo
+        read -e -p "按Enter键继续..."
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    if [ $# -gt 0 ]; then
+        # CLI 模式：非本地操作需要先检查网络
+        case $1 in
+            --stop-all-containers|--kill-all|--check-npu|--help)
+                # 纯本地操作，跳过网络检查
+                ;;
+            *)
+                ensure_network || exit 1
+                ;;
+        esac
+
+        case $1 in
+            --stop-all-containers)
+                stop_all_containers
+                exit 0
+                ;;
+            --kill-all)
+                kill_all_related_process
+                exit 0
+                ;;
+            --check-npu)
+                check_npu_occupancy
+                exit 0
+                ;;
+            --install-claude-code)
+                install_claude_code "${2:-$DEFAULT_CLAUDE_CODE_INSTALL_DIR}"
+                exit 0
+                ;;
+            --install-vllm)
+                install_vllm "${2:-$DEFAULT_VLLM_INSTALL_DIR}" "${3:-$DEFAULT_VLLM_REPO}" "${4:-$DEFAULT_VLLM_BRANCH}"
+                exit 0
+                ;;
+            --install-vllm-ascend)
+                install_vllm_ascend "${2:-$DEFAULT_VLLM_ASCEND_INSTALL_DIR}" "${3:-$DEFAULT_VLLM_ASCEND_REPO}" "${4:-$DEFAULT_VLLM_ASCEND_BRANCH}"
+                exit 0
+                ;;
+            --install-vllm-all)
+                install_vllm_all "${2:-$DEFAULT_VLLM_INSTALL_DIR}"
+                exit 0
+                ;;
+            --help)
+                echo "用法: $0 [选项]"
+                echo "选项:"
+                echo "  --check-npu                            查看NPU占用者"
+                echo "  --install-vllm [DIR] [REPO] [BRANCH]   安装vllm（默认: 当前目录, $DEFAULT_VLLM_REPO, $DEFAULT_VLLM_BRANCH）"
+                echo "  --install-vllm-ascend [DIR] [REPO] [BRANCH]  安装vllm-ascend（默认: 当前目录, $DEFAULT_VLLM_ASCEND_REPO, $DEFAULT_VLLM_ASCEND_BRANCH）"
+                echo "  --install-vllm-all [DIR]               一键安装vllm+vllm-ascend（默认: 当前目录）"
+                echo "  --install-claude-code [DIR]            安装Claude Code（末尾可选配置终端桌宠 CodeNoNo）"
+                echo "  --help                                 显示此帮助信息"
+                exit 0
+                ;;
+            *)
+                log_error "未知参数: $1"
+                echo "使用 --help 查看帮助信息"
+                exit 1
+                ;;
+        esac
+    else
+        main "$@"
+    fi
+fi

@@ -1,0 +1,20 @@
+# ============================================================================
+# model.yaml — 模型与源码路径配置
+# ============================================================================
+# 使用前请根据实际环境修改对应字段
+#
+# ===== 字段说明 =====
+#   model_path:           模型权重路径
+#                         - vLLM 服务加载模型
+#                         - aisbench 加载 tokenizer 生成测试数据集
+#   vllm_source:          vLLM 上游源码目录（只读，用于参考原生实现定位精度差异）
+#   vllm_ascend_source:   vLLM-Ascend 插件源码目录（唯一允许修改的代码区）
+#   pip_package:          pip 包名，修改源码后用于重新安装
+#   fix_record_prefix:    修复记录文件前缀，生成 fix_1.md、fix_2.md ...
+# ============================================================================
+
+model_path: "/home/weight/<your-model-path>/"                                    # 模型权重路径
+vllm_source: "/home/user/vllm"                                            # vLLM 源码路径（只读）
+vllm_ascend_source: "/home/user/vllm-ascend"                              # vLLM-Ascend 源码路径（可修改）
+pip_package: "vllm-ascend"                                              # pip 包名
+fix_record_prefix: "fix"                                                # 修复记录前缀

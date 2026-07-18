@@ -1,0 +1,6 @@
+# Memory Index
+
+- [weight-load-optimization](weight-load-optimization.md) — MoE expert load 10min→3.6min via thread pool + cleanup; committed e103aca0 (vllm-ascend) / f53bb4fb0 (vllm); clone is the next bottleneck; deferred mmap-drain fix.
+- [measure-before-optimize](measure-before-optimize.md) — confirm bottleneck with timing before optimizing; act on data not hypothesis.
+- [commit-style](commit-style.md) — strip Co-Authored-By, keep Signed-off-by: LookAround0301, concise accurate messages; amend when target is HEAD.
+- [graph-mode-prefetch-investigation](graph-mode-prefetch-investigation.md) — Graph-mode expert prefetch: 5 failed approaches, fundamental D2H-in-host-fn wall, Pattern A (acl_graph replay hook) is the only viable path; eager predict fix works.

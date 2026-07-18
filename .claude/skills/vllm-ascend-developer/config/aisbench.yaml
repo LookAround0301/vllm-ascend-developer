@@ -1,0 +1,102 @@
+# ============================================================================
+# aisbench.yaml — aisbench 精度/性能评测配置
+# ============================================================================
+# 工具仓库: https://github.com/rayn-zzz/aisbench_auto_tools_prefix
+# 使用前请根据实际环境修改对应字段
+#
+# ===== 评测机器说明 =====
+#   运行 aisbench_auto_tools_prefix 的机器，可能与推理服务在同一台或不同机器。
+#   评测机器通过 SSH 连接，aisbench 在 Docker 容器内执行。
+#
+# ===== 字段说明 =====
+#   eval_machine:          评测机器连接信息
+#     host/port/user/password:  SSH 连接参数
+#     docker:                   容器配置
+#       name:                   容器名称
+#       work_dir:               aisbench_auto_tools_prefix 所在目录
+#   aisbench:               aisbench 工作环境
+#     work_path:             git clone benchmark 后的目录绝对路径
+#                            （可通过 pip show ais-bench-benchmark | grep Location 查询）
+#     dataset_path:          测试数据集存放目录
+#     model_name:            服务化注册的模型名称（--served-model-name）
+#     model_path:            模型权重路径，用于加载 tokenizer 生成数据集
+#   benchmark:              压测参数（对应 aisbench_test.py 的 CLI 参数）
+#     input_len:             每条请求的输入 token 数
+#     output_len:            每条请求的输出 token 数
+#     data_num:              测试样本总数
+#     concurrency:           最大并发数
+#     request_rate:          请求速率（0 = 不限制）
+#     test_type:             "stream"（流式）| "text"（非流式）
+#     test_accuracy:         是否开启精度测试（非零温度 + dump eval details）
+#     npu_num:               NPU 卡数（用于计算单卡吞吐）
+#     repeat:                重复执行次数
+#     enable_think:          开启 DeepSeek V3.1 thinking 模式
+#     performance_test:      "default_perf"（标准性能测试）| "stable_stage"（稳态测试）
+#   prefix_cache:           Prefix Cache 测试参数（可选）
+#     enabled:               是否开启 prefix cache 测试
+#     dataset_type:          "normal" | "prefix_cache"
+#     prefix_num:            不同前缀数量
+#     repeat_rate:           前缀复用比例（如 "50%" 或 0.5）
+#     seed:                  随机种子（控制前缀与后缀间的分隔 token）
+#     dp:                    DP 域数量
+#   service:                目标推理服务（aisbench 发压目标）
+#     host_ip:               推理服务 IP
+#     host_port:             推理服务端口
+#     pod_info:              PD 分离模式下的多 POD 列表（standalone 模式留空）
+#                           格式: ["ip1:port1", "ip2:port2"]
+#     generation_kwargs:     生成参数（精度测试时使用）
+#       temperature / top_p / seed
+#       chat_template_kwargs: 聊天模板参数
+# ============================================================================
+
+# 评测机器信息
+eval_machine:
+  host: "<eval-machine-ip>"                                          # 评测机器 IP
+  port: 22                                                             # SSH 端口
+  username: "root"                                                     # SSH 用户名
+  password: "<your-password>"                                         # SSH 密码
+  docker:                                                              # 容器配置
+    name: "aisbench-dev"                                             # 容器名称
+    work_dir: "/path/to/aisbench/tools"                               # 工具目录
+
+# aisbench 工作环境
+aisbench:
+  work_path: "/home/user/aisbench/benchmark"                                    # benchmark 目录
+  dataset_path: "/path/to/datasets"                                          # 数据集存放目录
+  model_name: "<served-model-name>"                                    # --served-model-name
+  model_path: "/path/to/model-weights"                                 # 模型权重路径（用于 tokenizer）
+
+# 压测参数
+benchmark:
+  input_len: 32768                                                      # 输入 token 长度
+  output_len: 500                                                     # 输出 token 长度
+  data_num: 1                                                       # 样本数
+  concurrency: 1                                                    # 最大并发
+  request_rate: 0                                                      # 请求速率（0=不限）
+  test_type: "stream"                                                  # "stream" | "text"
+  test_accuracy: false                                                 # 精度测试开关
+  npu_num: 1                                                           # NPU 卡数
+  repeat: 1                                                            # 重复次数
+  enable_think: false                                                  # thinking 模式
+  performance_test: "default_perf"                                     # "default_perf" | "stable_stage"
+
+# Prefix Cache 测试（可选）
+prefix_cache:
+  enabled: true                                                       # 是否开启
+  dataset_type: "prefix_cache"                                         # "normal" | "prefix_cache"
+  prefix_num: 1                                                        # 前缀数量
+  repeat_rate: "90%"                                                   # 前缀复用比例
+  seed: 1                                                              # 随机种子
+  dp: 1                                                                # DP 域数量
+
+# 目标推理服务
+service:
+  host_ip: "<inference-server-ip>"                                      # 推理服务 IP
+  host_port: 8080                                                      # 推理服务端口
+  pod_info: []                                                         # PD分离多POD: ["ip1:port1", "ip2:port2"]
+  generation_kwargs:                                                   # 精度测试生成参数
+    temperature: 0.0
+    top_p: 0.0
+    seed: 4
+    chat_template_kwargs:
+      thinking: false

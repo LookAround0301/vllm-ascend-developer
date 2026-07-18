@@ -1,0 +1,1 @@
+- [Runtime patches override upstream](runtime-patches-override-upstream.md) — vllm-ascend monkeypatches + NPUModelRunner override upstream vllm at runtime; static reads of vllm/ mislead. Prefer empirical diag logs.

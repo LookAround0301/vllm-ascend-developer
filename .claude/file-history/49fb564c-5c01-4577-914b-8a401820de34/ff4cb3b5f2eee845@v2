@@ -1,0 +1,12 @@
+
+# 自动配置的代理（由安装脚本添加）
+export http_proxy="http://p_atlas:proxy%40123@141.3.169.143:8080"
+export https_proxy="http://p_atlas:proxy%40123@141.3.169.143:8080"
+export no_proxy="127.0.0.1,.huawei.com,localhost,local,.local"
+export GIT_SSL_NO_VERIFY=1
+
+
+# Claude Code 环境变量（由安装脚本添加）
+export PATH=/home/test/claude_code_env/node-v24.14.0-linux-arm64/bin:$PATH
+export NODE_TLS_REJECT_UNAUTHORIZED=0
+export IS_SANDBOX=1

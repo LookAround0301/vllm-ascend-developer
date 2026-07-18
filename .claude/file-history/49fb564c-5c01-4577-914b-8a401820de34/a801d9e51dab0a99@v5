@@ -1,0 +1,251 @@
+# vllm-ascend-developer
+
+本仓库包含两个**同级组件**，一个是开发调试 Skill，一个是一键安装脚本：
+
+- **Skill（开发调试）**：vLLM + vLLM-Ascend 通用开发与调试 Skill，覆盖推理精度诊断、服务管理、自动化测试与代码修复，支持**单机**和**PD分离**两种部署模式。 → 见下方「Skill」章节
+- **HyperScript（一键安装）**：交互式 TUI 脚本，负责 vllm / vllm-ascend / Claude Code 安装，以及 Docker 容器与 NPU/进程管理。 → 见下方「HyperScript 一键安装脚本」章节
+
+## 目录结构
+
+```
+vllm-ascend-developer/                 # 仓库根
+├── README.md                          # 本文件
+├── HyperScript/                       # 【一键安装脚本】与 Skill 同级
+│   ├── HyperScript.sh                 # 安装 vllm/vllm-ascend/Claude Code、容器/NPU/进程管理
+│   └── statusline.py                  # Claude Code 状态栏脚本（随 Claude Code 安装自动部署）
+└── vllm-ascend-developer/             # 【Skill】开发调试 Skill（Claude Code 加载入口）
+    ├── SKILL.md                       # Skill 主入口
+    ├── CLAUDE.md                      # Claude Code 项目指南
+    ├── config/                        # 配置文件（使用前需根据实际环境修改）
+    │   ├── service.yaml               # 服务配置（部署模式、SSH、Docker、端口）
+    │   ├── test.yaml                  # 测试用例（端点、参数、prompt、预期输出）
+    │   ├── model.yaml                 # 模型路径与源码路径
+    │   ├── aisbench.yaml              # aisbench 精度/性能评测配置
+    │   └── proxy.yaml                 # 网络代理配置（pip/git 公网访问）
+    ├── modules/                       # 核心模块
+    │   ├── service.md                 # 服务生命周期管理（启动/停止/健康检查）
+    │   ├── test-runner.md             # 测试执行器（发送推理请求）
+    │   ├── verifier.md                # 结果验证器（对比预期输出）
+    │   ├── aisbench-evaluator.md      # 精度数据集评测（aisbench）
+    │   ├── log-analyzer.md            # 日志分析器（错误分类与定位）
+    │   ├── auto-fixer.md              # 自动修复引擎（迭代修复 + fix_N.md 记录）
+    │   └── flashcomm-mtp-debug.md     # FlashComm + MTP 调试专项指南
+    ├── workflows/                     # 工作流
+    │   └── precision-diagnosis.md     # 端到端精度诊断工作流
+    ├── scripts/                       # 工具脚本
+    │   ├── ssh_utils.py               # SSH 远程执行（exec/wait/upload/download）
+    │   └── generate_curl.py           # 从 config/test.yaml 生成 curl 测试脚本
+    └── docs/                          # 调试经验文档
+        ├── dcp2tp4-precision-fix.md   # DCP 精度调试案例（逐层对比 + float64 LSE merge）
+        └── pcp-hybrid-nan-fix.md      # PCP NaN 案例（bool mask fill_() 写回陷阱）
+```
+
+> 仓库根 = `README.md` + `HyperScript/`（一键安装脚本）+ 同名子目录 `vllm-ascend-developer/`（Skill 全部文件：`SKILL.md`、`CLAUDE.md`、`config/`、`modules/`、`workflows/`、`scripts/`、`docs/`）。
+
+---
+
+## Skill：vllm-ascend-developer
+
+Skill 主入口为 [`vllm-ascend-developer/SKILL.md`](./vllm-ascend-developer/SKILL.md)，提供精度诊断、服务管理、测试执行与自动修复等能力。
+
+### 快速开始
+
+#### 第零步：安装依赖
+
+```bash
+pip install paramiko pyyaml -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+验证安装：
+
+```bash
+python -c "import paramiko, yaml; print('ok')"
+# 输出 ok
+```
+
+#### 第一步：配置环境
+
+根据自己的实际环境，修改以下配置文件：
+
+1. **`config/service.yaml`** — 设置部署模式（standalone/pd-separated）、服务器 SSH、Docker 参数
+2. **`config/test.yaml`** — 设置测试用例（端点、参数、prompt、预期输出）
+3. **`config/model.yaml`** — 设置模型路径和 vllm-ascend 源码路径
+4. **`config/aisbench.yaml`** — 【可选】设置精度数据集评测参数
+5. **`config/proxy.yaml`** — 【可选】设置网络代理
+
+#### 第二步：执行精度诊断工作流
+
+按照 `workflows/precision-diagnosis.md` 中的步骤执行：
+
+```
+初始化配置 → 启动服务 → 健康检查 → 执行测试 → 验证结果
+    ↓ 不通过
+  分析日志 → 修复代码 → 重启服务 → 回到测试
+```
+
+每次修复迭代记录在 `fix_N.md`（N 从 1 递增）。
+
+### 两种部署模式
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| **standalone**（单机） | prefill 与 decode 在同一台机器上混合调度 | 单台 NPU 服务器，开发测试 |
+| **pd-separated**（PD分离） | P 节点（prefill）与 D 节点（decode）分离部署，通过 proxy 协调 | 大规模分布式推理，独立扩缩容 |
+
+### 精度 / 性能评测（aisbench）
+
+对于数据集级别的精度验证和性能压测，推荐使用 [aisbench_auto_tools_prefix](https://github.com/rayn-zzz/aisbench_auto_tools_prefix)。
+
+#### 工具简介
+
+`aisbench_auto_tools_prefix` 是一个基于 aisbench 的自动化评测工具，支持：
+
+- **精度评测**：在 GSM8K、GPQA 等数据集上评估模型推理精度
+- **性能压测**：可配置输入/输出 token 长度、并发数、请求速率等参数
+- **Prefix Cache 测试**：支持前缀缓存场景下的性能与精度测试
+- **流式 / 非流式**：支持 `stream` 和 `text` 两种推理模式
+- **Thinking 模式**：支持 DeepSeek V3.1 等模型的 thinking 输出
+
+#### 在本 Skill 中的集成
+
+评测机器通过 `config/aisbench.yaml` 配置，Skill 中的 `modules/aisbench-evaluator.md` 模块提供了完整的评测流程：
+
+1. 修改 aisbench 配置文件指向推理服务
+2. 确保 vLLM 推理服务健康检查通过（返回 200）
+3. 执行 `ais_bench` 命令进行评测
+4. 从日志中提取 **accuracy** 指标
+5. 分析模型输出文件（检查乱码、复读）
+6. 根据结果决定是否进入修复迭代
+
+#### 重新安装 aisbench（容器内）
+
+Docker 容器内自带的 `ais-bench-benchmark` 版本可能不兼容，需要先卸载再重新从源码安装：
+
+```bash
+# 1. 卸载旧版本
+pip uninstall ais-bench-benchmark -y
+
+# 2. 清理残留文件
+rm -rf /usr/local/python3.11.10/lib/python3.11/site-packages/ais_bench/
+
+# 3. 克隆并安装 benchmark
+git clone https://github.com/AISBench/benchmark.git
+pip3 install -e ./benchmark --use-pep517 -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 4. 安装依赖
+pip3 install -r ./benchmark/requirements/api.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip3 install -r ./benchmark/requirements/extra.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+> **说明**：容器内预装的 aisbench 可能与 [aisbench_auto_tools_prefix](https://github.com/rayn-zzz/aisbench_auto_tools_prefix) 不兼容，使用前务必按上述步骤重装。
+
+#### 核心要求
+
+> **重要**：aisbench 评测必须在 vLLM 服务完全启动并通过健康检查后才能执行，严禁在服务未就绪时发起评测。
+
+### 环境要求
+
+- 目标服务器已安装 Docker
+- 已配置 Ascend NPU 设备（`npu-smi` 可用）
+- vLLM 和 vLLM-Ascend 已在容器内预装
+- Python 3.x + paramiko + pyyaml
+
+### 注意事项
+
+1. **只修改 vllm-ascend 代码** — 禁止修改 vLLM 上游源码
+2. **每个 `ssh_utils exec` 命令独立执行** — 不同 exec 之间不可用 `&&` 链式连接
+3. **禁止擅自重装** — vLLM 和 vLLM-Ascend 容器内已预装，未经同意禁止 `pip install`
+4. **按端口杀进程** — 使用 `fuser -k {port}/tcp`，不误伤其他服务
+5. **启动耗时** — vLLM 服务启动通常需要 10 分钟以上
+6. **配置一致性** — 启动脚本和测试脚本中的端口、模型名称必须一致
+7. **密码保护** — 配置文件中含敏感信息，建议将 `config/` 加入 `.gitignore`
+
+---
+
+## HyperScript 一键安装脚本
+
+[`HyperScript/HyperScript.sh`](./HyperScript/HyperScript.sh) 是与 Skill 同级的独立组件，一个交互式 TUI 脚本（`↑↓` 移动、`空格/x` 多选、`Enter` 确认），把 vLLM-Ascend 开发环境的常用运维操作集中到一个菜单；也支持 CLI 参数非交互调用。默认配置（代理、镜像源、分支、Node 版本等）集中在脚本顶部的 `DEFAULT_*` 变量。
+
+### 功能概览
+
+| 菜单项 | 说明 |
+|--------|------|
+| **安装 vllm / vllm-ascend / 一键安装** | 从 GitHub 克隆源码 `pip install -e .`（清华源），支持手输或从远程分支列表选分支，安装前自动卸载旧版本；「一键安装」依次装两者。 |
+| **创建 vllm 容器** | 交互选择本地镜像与容器名，`docker run` 创建挂载全部 Ascend NPU 设备（`--privileged`、`--net=host`、`--shm-size=500g`）的开发容器，挂载 `/home`、`/data`、driver 等，可选创建后直接进入。 |
+| **万能杀** | 强制查杀 `python`/`torchrun`/`ray`/`vllm` 进程及其僵尸（defunct）父进程并停 ray 服务——排查卡死/残留进程时一键清理。 |
+| **停止所有运行容器** | 列出运行中容器，确认后批量 `docker stop`/`kill`（5s 超时保护，避免卡顿）。 |
+| **看看谁在用卡** | 解析 `npu-smi info` 进程区提取 PID，再用 `pwdx` 查每个进程工作目录，定位 NPU 占用者。 |
+| **安装 Claude Code** | 安装 Claude Code CLI，并自动部署状态栏与 `IS_SANDBOX` 等环境变量（详见下文）。 |
+| **清除代理** | 清理 `http(s)_proxy`/`no_proxy`/`GIT_SSL_NO_VERIFY` 环境变量，以及 `~/.bashrc`、`~/.pip/pip.conf`、`~/.gitconfig` 中的代理配置。 |
+
+### 安装 Claude Code（含状态栏）
+
+选择「安装 Claude Code」会自动完成 5 步：
+
+1. **Node.js**：华为云镜像下载解压（默认 `v24.14.0` arm64），bin 目录写入 `PATH`
+2. **Claude Code CLI**：npm 安装（淘宝源 `registry.npmmirror.com`，失败依次回退腾讯云 / 华为云）
+3. **状态栏**：把同级 [`statusline.py`](./HyperScript/statusline.py) 复制到 `~/.claude/`，并写入 `settings.json` 的 `statusLine`（自动检测 `python3` 绝对路径，跨机器可用）
+4. **`settings.json`**：写入 `~/.claude/settings.json`，默认内容如下（Haiku/Sonnet/Opus 三档全部映射到 `glm-5.2[1m]`，`ANTHROPIC_API_KEY` 仅留占位符 —— **需自行填入真实 Key**）：
+   ```json
+   {
+     "env": {
+       "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
+       "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
+       "ANTHROPIC_DEFAULT_HAIKU_MODEL":  "glm-5.2[1m]",
+       "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2[1m]",
+       "ANTHROPIC_DEFAULT_OPUS_MODEL":   "glm-5.2[1m]",
+       "ANTHROPIC_API_KEY": "YOUR_API_KEY_HERE",
+       "API_TIMEOUT_MS": "3000000"
+     },
+     "outputStyle": "engineer-professional",
+     "skipDangerousModePermissionPrompt": true,
+     "statusLine": { "type": "command", "command": "<python3 绝对路径> ~/.claude/statusline.py" }
+   }
+   ```
+5. **环境变量**：`~/.bashrc` 追加以下 3 行（幂等——写入前先用 `sed` 删除旧的同名块，重复安装不会累积重复行）：
+   ```bash
+   export PATH=<node_bin_dir>:$PATH
+   export NODE_TLS_REJECT_UNAUTHORIZED=0
+   export IS_SANDBOX=1
+   ```
+6. **可选·终端桌宠**：5 步装完后会弹出 TUI 询问「是否配置终端桌宠 (CodeNoNo)」；选配置即自动装好一个跑在 tmux 窗格里、随 Claude Code 状态动的桌面宠物（详见下方「可选：终端桌宠」）。
+
+装完后的状态栏效果（随会话刷新自动更新）：
+
+```
+glm-5.2 | [EFFORT] high | [CTX] [▍░░░░░░░░░] 4% | [COST] $0.93 | [SPEED] 63 tok/s
+```
+
+依次显示：模型名 · 思考强度（effort）· 上下文进度条（绿 <50% / 黄 <80% / 红）· 累计花费 · 输出速度（tok/s）。
+
+### 可选：终端桌宠 (CodeNoNo)
+
+选择「配置终端桌宠」后，会在 `~/.claude/pet/` 装一套**终端版**桌宠（与 GUI 版 clawd-on-desk 不同——无需图形桌面，headless SSH 终端即可用）：一个 CodeNoNo 机器人跑在 tmux 小窗格里，随 Claude Code 状态（思考 / 跑工具 / 完成 / 报错…）切换动画。
+
+- **形象**：直接渲染 [`awesome-codex-pet`](https://github.com/rullerzhou-afk/awesome-codex-pet) 的 CodeNoNo 精灵图为终端字符画（ANSI 真彩色 + ▀ 半块），仓库自带 `HyperScript/clawd-term/codenono.webp`，离线可用。
+- **原理**：Claude Code hooks 把事件写成状态词 → `pet.py` 渲染对应动画帧 → 显示在 tmux 窗格。
+- **启动**：`bash ~/.claude/pet/start.sh col`（右侧窄列）或 `start.sh`（底部窄条）；进入 tmux 后在主窗格跑 `claude`，桌宠随之动。
+- **清晰度/尺寸**：编辑 `~/.claude/pet/pet.py` 顶部 `PET_W`（默认 40，调大更清晰）。
+- **颜色**需终端支持真彩色（iTerm2 / Windows Terminal / kitty 等）；不行的话形状照常显示，可 `Ctrl+B : set -ag terminal-overrides ',*:Tc'` 开启。
+
+### 小贴士：翻看 Claude Code 的历史上下文
+
+Claude Code **经典模式**下，鼠标滚轮和 `PgUp/PgDn` 都翻不了对话历史（claude 的输出在备用屏幕，不在终端 scrollback 里）。要看历史内容，二选一：
+
+- **全屏模式（推荐）**：会话里 `/tui fullscreen` → 用 `PgUp/PgDn` 翻历史；全屏下鼠标滚轮也能滚（需 tmux 里 `Ctrl+B :` `set -g mouse on`）。全屏不影响右侧桌宠（独立窗格）。
+- **任意模式**：按 `Ctrl+O` 进 transcript 审阅（`j/k` 翻、`Ctrl+u/d` 半屏、`/` 搜索、`q` 退出）。
+
+> 想让全屏成为默认：在 `~/.claude/settings.json` 的 `env` 里加 `"CLAUDE_CODE_NO_FLICKER": "1"`，**改完必须重启 claude 才生效**。
+
+### CLI 非交互用法
+
+```bash
+bash HyperScript/HyperScript.sh --install-claude-code [DIR]        # 安装 Claude Code
+bash HyperScript/HyperScript.sh --install-vllm-all [DIR]           # 一键安装 vllm + vllm-ascend
+bash HyperScript/HyperScript.sh --install-vllm [DIR] [REPO] [BRANCH]
+bash HyperScript/HyperScript.sh --install-vllm-ascend [DIR] [REPO] [BRANCH]
+bash HyperScript/HyperScript.sh --check-npu                        # 查看 NPU 占用者
+bash HyperScript/HyperScript.sh --kill-all                         # 万能杀
+bash HyperScript/HyperScript.sh --stop-all-containers              # 停止所有容器
+bash HyperScript/HyperScript.sh --help
+```

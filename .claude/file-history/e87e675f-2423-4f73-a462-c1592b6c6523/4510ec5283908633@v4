@@ -1,0 +1,652 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from dataclasses import dataclass, field
+
+import torch
+from typing_extensions import Self
+from vllm.config import VllmConfig
+from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
+from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, MLAAttentionSpec, SlidingWindowMLASpec
+from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager, OffloadMLAAttentionManager
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+
+def _get_c8_k_cache_dtype() -> torch.dtype:
+    return torch.float8_e4m3fn if get_ascend_device_type() == AscendDeviceType.A5 else torch.int8
+
+
+def _get_c8_k_scale_cache_dtype() -> torch.dtype:
+    return torch.float32 if get_ascend_device_type() == AscendDeviceType.A5 else torch.float16
+
+
+# GLM5.2 / DSV3.2 SFA offload + LIC8 unified pool layout (spec_0 / spec_1).
+# Per-token byte layout (DSV3.2 / GLM5.2 A3 example):
+#   spec_0: (k 512 + v 64 + pad 8) * 2 bytes (bf16)
+#   spec_1: (idx 128 + pad 16 + scale 2) * 1 byte (int8 byte-mix accounting)
+# scale is physically 1 fp16 element (2 bytes); it is counted as 2 in the
+# spec_1 formula so page_bytes matches the int8 + pad byte mix.
+# block_size=128 → page_bytes spec_0:spec_1 == 8:1 for unify_kv_cache_spec_page_size;
+# indexer kernel block_size = page_block_multiplier * main block_size (1024 tokens).
+# Pad and page_block_multiplier are derived from model dims via
+# ``compute_offload_sparse_c8_layout`` (not hardcoded).
+
+
+def offload_indexer_pad_dim(
+    index_head_dim: int,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+) -> int:
+    return index_head_dim * qk_rope_head_dim // kv_lora_rank
+
+
+@dataclass(frozen=True)
+class OffloadSparseC8Layout:
+    """Derived C8 unified-pool layout for SFA offload."""
+
+    indexer_pad_dim: int
+    kv_pad_dim_bf16_slots: int
+    page_block_multiplier: int
+    main_bytes_per_token: int
+    indexer_bytes_per_token: int
+
+
+def compute_offload_sparse_c8_layout(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_head_dim: int,
+    main_dtype: torch.dtype,
+    *,
+    scale_dtype: torch.dtype | None = None,
+) -> OffloadSparseC8Layout:
+    """Derive spec_0/spec_1 page layout from model dimensions.
+
+    ``page_block_multiplier`` enforces the main:indexer page ratio required by
+    ``unify_kv_cache_spec_page_size``. ``kv_pad_dim_bf16_slots`` pads spec_0 so
+    its per-token byte count fills that ratio against the spec_1 byte-mix layout.
+    """
+    scale_dtype = scale_dtype or _get_c8_k_scale_cache_dtype()
+    indexer_pad_dim = offload_indexer_pad_dim(
+        index_head_dim, qk_rope_head_dim, kv_lora_rank
+    )
+    indexer_bytes_per_token = offload_c8_indexer_bytes_per_token(
+        index_head_dim, indexer_pad_dim, scale_dtype
+    )
+    dtype_size = get_dtype_size(main_dtype)
+    non_c8_main_bytes = (kv_lora_rank + qk_rope_head_dim) * dtype_size
+    page_block_multiplier = 2 * kv_lora_rank // index_head_dim
+    main_bytes_per_token = page_block_multiplier * indexer_bytes_per_token
+    kv_pad_dim_bf16_slots = (
+        main_bytes_per_token - non_c8_main_bytes
+    ) // dtype_size
+    assert kv_pad_dim_bf16_slots >= 0
+    assert main_bytes_per_token == offload_c8_main_bytes_per_token(
+        kv_lora_rank,
+        qk_rope_head_dim,
+        main_dtype,
+        kv_pad_dim_bf16_slots=kv_pad_dim_bf16_slots,
+    )
+    assert main_bytes_per_token % indexer_bytes_per_token == 0
+    assert (
+        main_bytes_per_token // indexer_bytes_per_token
+        == page_block_multiplier
+    )
+    return OffloadSparseC8Layout(
+        indexer_pad_dim=indexer_pad_dim,
+        kv_pad_dim_bf16_slots=kv_pad_dim_bf16_slots,
+        page_block_multiplier=page_block_multiplier,
+        main_bytes_per_token=main_bytes_per_token,
+        indexer_bytes_per_token=indexer_bytes_per_token,
+    )
+
+
+def offload_c8_main_bytes_per_token(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    dtype: torch.dtype,
+    *,
+    kv_pad_dim_bf16_slots: int,
+) -> int:
+    dtype_size = get_dtype_size(dtype)
+    return (
+        kv_lora_rank * dtype_size
+        + qk_rope_head_dim * dtype_size
+        + kv_pad_dim_bf16_slots * dtype_size
+    )
+
+
+def offload_main_kv_head_dims_for_pool_split(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    *,
+    c8_layout: OffloadSparseC8Layout | None = None,
+) -> list[int]:
+    dims = [kv_lora_rank, qk_rope_head_dim]
+    if c8_layout is not None:
+        dims.append(c8_layout.kv_pad_dim_bf16_slots)
+    return dims
+
+
+def offload_indexer_kernel_block_size(
+    mla_block_size: int,
+    kv_lora_rank: int,
+    index_head_dim: int,
+    *,
+    c8_layout: OffloadSparseC8Layout | None = None,
+) -> int:
+    if c8_layout is not None:
+        return mla_block_size * c8_layout.page_block_multiplier
+    return mla_block_size * kv_lora_rank // index_head_dim
+
+
+def offload_indexer_aligned_bytes_per_token(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_head_dim: int,
+    main_dtype: torch.dtype,
+) -> int:
+    """Padded non-C8 indexer bytes/token so its page integer-divides the MLA page.
+
+    The bf16 MLA:indexer head ratio need not be an integer (e.g. GLM5.2
+    576:128 = 4.5), which makes ``unify_kv_cache_spec_page_size`` raise
+    (max_page % layer_page != 0). Pad the indexer page up to
+    ``main_bytes_per_token // (kv_lora_rank // index_head_dim)`` so that
+    MLA % indexer == 0 and the unified indexer ``block_size`` equals
+    ``offload_indexer_kernel_block_size`` (non-C8 branch). The indexer tensor
+    is still allocated at its true head dim; the extra bytes are page-accounting
+    padding, same model as the C8 unified pool.
+    """
+    main_bytes_per_token = (kv_lora_rank + qk_rope_head_dim) * get_dtype_size(main_dtype)
+    multiplier = kv_lora_rank // index_head_dim
+    assert multiplier > 0
+    assert main_bytes_per_token % multiplier == 0, (
+        "MLA bytes/token must be divisible by the indexer kernel-block "
+        "multiplier to align indexer/MLA pages for unify_kv_cache_spec_page_size."
+    )
+    return main_bytes_per_token // multiplier
+
+
+def offload_c8_indexer_bytes_per_token(
+    index_head_dim: int,
+    indexer_pad_dim: int,
+    scale_dtype: torch.dtype,
+) -> int:
+    return (
+        index_head_dim * get_dtype_size(torch.int8)
+        + indexer_pad_dim
+        + get_dtype_size(scale_dtype)
+    )
+
+
+def _offload_page_size_bytes(
+    block_size: int,
+    num_kv_heads: int,
+    page_bytes_per_token: int,
+) -> int:
+    return block_size * num_kv_heads * page_bytes_per_token
+
+
+def offload_c8_main_page_size_bytes(
+    block_size: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    dtype: torch.dtype,
+    *,
+    num_kv_heads: int = 1,
+    c8_layout: OffloadSparseC8Layout | None = None,
+    index_head_dim: int | None = None,
+    scale_dtype: torch.dtype | None = None,
+) -> int:
+    if c8_layout is None:
+        assert index_head_dim is not None
+        c8_layout = compute_offload_sparse_c8_layout(
+            kv_lora_rank,
+            qk_rope_head_dim,
+            index_head_dim,
+            dtype,
+            scale_dtype=scale_dtype,
+        )
+    return _offload_page_size_bytes(
+        block_size,
+        num_kv_heads,
+        c8_layout.main_bytes_per_token,
+    )
+
+
+def offload_c8_indexer_page_size_bytes(
+    block_size: int,
+    index_head_dim: int,
+    indexer_pad_dim: int,
+    scale_dtype: torch.dtype,
+    *,
+    num_kv_heads: int = 1,
+) -> int:
+    """Indexer-group page size for C8 offload unified pool (spec_1).
+
+    Byte-mix per token: ``index_head_dim`` int8 bytes + ``indexer_pad_dim``
+    pad bytes + ``get_dtype_size(scale_dtype)`` for one scale element (e.g. 2
+    bytes for fp16). The sum is not multiplied by a single dtype size; each
+    term is already in bytes so spec_1 can 8:1-unify with spec_0.
+    """
+    return _offload_page_size_bytes(
+        block_size,
+        num_kv_heads,
+        offload_c8_indexer_bytes_per_token(
+            index_head_dim, indexer_pad_dim, scale_dtype
+        ),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class AscendMLAAttentionSpec(MLAAttentionSpec):
+    """MLAAttentionSpec extended to support DSA models, with optional Sparse C8 support.
+
+    When Sparse C8 is enabled, the KV cache tuple changes from
+    (kv_cache[0]: bfloat16, kv_cache[1]: bfloat16, kv_cache[2]: bfloat16)
+    to
+    (kv_cache[0]: bfloat16, kv_cache[1]: bfloat16, kv_cache[2]: int8, kv_cache[3]: float16).
+
+    The semantic meaning of each native KV cache entry is as follows:
+    1. kv_cache[0] stores kv_lora.
+    2. kv_cache[1] stores k_rope.
+    3. kv_cache[2] stores the key tensor from the indexer module.
+    4. kv_cache[3] stores the key scale tensor from the indexer module,
+       and exists only when Sparse C8 is enabled.
+
+    With SFA KV-quant sparse attention, kv_lora, k_rope, and per-tile
+    quantization scales are packed into kv_cache[0]. The resulting cache is
+    (packed_kv, indexer_k) or (packed_kv, indexer_k, indexer_scale) when
+    Sparse C8 indexer cache is enabled.
+
+    The main changes are as follows:
+    1. The key tensor from the indexer module stored in kv_cache[2] is
+       converted from bf16 to int8 to reduce memory usage. It is then
+       processed with int8 precision in Lightning_indexer computation
+       to improve computational efficiency.
+    2. The quantization scale of the key tensor in the indexer module
+       must also be stored for the Lightning_indexer_quant operator,
+       and is therefore saved in kv_cache[3].
+    """
+
+    scale_dim: int = 0
+    scale_dtype: torch.dtype = torch.int8
+    sparse_head_dim: tuple[int, ...] | None = None
+    cache_sparse_c8: bool = False
+    # SFA offload + LIC8 unified pool: precomputed bytes/token for page_size.
+    # When set, page_size_bytes = block_size * num_kv_heads * page_bytes_per_token.
+    page_bytes_per_token: int | None = None
+    c8_k_cache_dtype: torch.dtype = field(default_factory=_get_c8_k_cache_dtype)
+    c8_k_scale_cache_dtype: torch.dtype = field(default_factory=_get_c8_k_scale_cache_dtype)
+
+    @property
+    def page_size_bytes(self) -> int:
+        if self.page_bytes_per_token is not None:
+            return _offload_page_size_bytes(
+                self.block_size,
+                self.num_kv_heads,
+                self.page_bytes_per_token,
+            )
+
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be MLAAttentionSpec."
+        )
+        layout_set = {
+            (
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                spec.scale_dim,
+                spec.scale_dtype,
+                spec.sparse_head_dim,
+                spec.dtype,
+            )
+            for spec in specs
+        }
+        assert len(layout_set) == 1, (
+            "All attention layers in the same KV cache group must use the same KV cache layout."
+        )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        assert len(cache_dtype_str_set) == 1, (
+            "All attention layers in the same KV cache group must use the same quantization method."
+        )
+        cache_sparse_c8_set = set(spec.cache_sparse_c8 for spec in specs)
+        assert len(cache_sparse_c8_set) == 1, (
+            "All attention layers in the same KV cache group must use the same sparse C8 setting."
+        )
+
+        page_bytes_per_token_set = set(
+            spec.page_bytes_per_token for spec in specs
+        )
+        assert len(page_bytes_per_token_set) == 1, (
+            "All attention layers in the same KV cache group must use the same "
+            "offload page_bytes_per_token setting."
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            scale_dim=specs[0].scale_dim,
+            scale_dtype=specs[0].scale_dtype,
+            sparse_head_dim=specs[0].sparse_head_dim,
+            dtype=specs[0].dtype,
+            cache_dtype_str=cache_dtype_str_set.pop(),
+            cache_sparse_c8=specs[0].cache_sparse_c8,
+            page_bytes_per_token=specs[0].page_bytes_per_token,
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        max_model_len = vllm_config.model_config.max_model_len
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        # Note(hc): each dcp rank only need save
+        # (max_model_len//dcp_world_size) tokens locally.
+        if dcp_world_size * pcp_world_size > 1:
+            max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
+        return cdiv(max_model_len, self.block_size * self.compress_ratio) * self.page_size_bytes
+
+
+@dataclass(frozen=True, kw_only=True)
+class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
+    """Sliding window attention with MLA cache format."""
+
+    cache_dtype_str: str | None = None
+    # DeepseekV4-only: see MLAAttentionSpec.model_version.
+    alignment: int | None = None  # Default to None for no padding.
+    compress_ratio: int = 1
+    model_version: str | None = None
+
+    def __post_init__(self):
+        pass
+
+    @property
+    def storage_block_size(self) -> int:
+        return self.block_size
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.storage_block_size * self.num_kv_heads * self.head_size * get_dtype_size(self.dtype)
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, AscendSlidingWindowMLASpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be AscendSlidingWindowMLASpec."
+        )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        compress_ratio_set = set(spec.compress_ratio for spec in specs)
+        model_version_set = set(spec.model_version for spec in specs)
+        sliding_window_set = set(spec.sliding_window for spec in specs)
+        assert (
+            len(cache_dtype_str_set) == 1
+            and len(compress_ratio_set) == 1
+            and len(model_version_set) == 1
+            and len(sliding_window_set) == 1
+        ), (
+            "All attention layers in the same KV cache group must use the same "
+            "quantization method, compress ratio, model version and sliding "
+            "window size."
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            dtype=specs[0].dtype,
+            page_size_padded=specs[0].page_size_padded,
+            sliding_window=sliding_window_set.pop(),
+            cache_dtype_str=cache_dtype_str_set.pop(),
+            compress_ratio=compress_ratio_set.pop(),
+            model_version=model_version_set.pop(),
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class OffloadMLAAttentionSpec(AttentionSpec):
+    # SFA offload + LIC8 unified pool: precomputed bytes/token for page_size.
+    page_bytes_per_token: int | None = None
+
+    @property
+    def page_size_bytes(self) -> int:
+        if self.page_bytes_per_token is not None:
+            return _offload_page_size_bytes(
+                self.block_size,
+                self.num_kv_heads,
+                self.page_bytes_per_token,
+            )
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * self.head_size
+            * get_dtype_size(self.dtype)
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        """The maximum possible memory usage of this KV cache in bytes.
+
+        Feeds the startup must-fit check (_check_enough_kv_cache_memory) and the
+        max_model_len auto-fit -- NOT num_blocks pool sizing, so changing this
+        only relaxes the max_model_len limit, it does not shrink the pool.
+        """
+        ktc = vllm_config.kv_transfer_config
+        if ktc is not None and ktc.kv_role == "kv_consumer":
+            # PD D-side keeps only the MLA resident tail in HBM: the
+            # remote-prefill prefix is null-padded, and completed decode blocks
+            # are freed in-place after save. Reserve current partial + one
+            # handoff block per request for the must-fit check.
+            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+            blocks_per_req = 2
+            return blocks_per_req * max_num_seqs * self.page_size_bytes
+        # Producer (P) or local offload (kv_both) or no kv-transfer: the prefix
+        # transits HBM during prefill before being offloaded, so the peak is the
+        # full max_model_len.
+        max_model_len = vllm_config.model_config.max_model_len
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
+
+def make_offload_main_mla_spec(
+    *,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    kv_lora_rank: int | None = None,
+    qk_rope_head_dim: int | None = None,
+    index_head_dim: int | None = None,
+    c8_unified_pool: bool = False,
+    scale_dtype: torch.dtype | None = None,
+) -> OffloadMLAAttentionSpec:
+    """Build main-MLA offload spec (spec_0).
+
+    When ``c8_unified_pool`` is set, page accounting uses the shared
+    ``page_bytes_per_token`` path (same formula as both offload groups).
+    """
+    page_bytes_per_token = None
+    if c8_unified_pool:
+        assert kv_lora_rank is not None and qk_rope_head_dim is not None
+        assert index_head_dim is not None
+        layout = compute_offload_sparse_c8_layout(
+            kv_lora_rank,
+            qk_rope_head_dim,
+            index_head_dim,
+            dtype,
+            scale_dtype=scale_dtype,
+        )
+        page_bytes_per_token = layout.main_bytes_per_token
+    return OffloadMLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+        page_bytes_per_token=page_bytes_per_token,
+    )
+
+
+def make_offload_indexer_mla_spec(
+    *,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    cache_dtype_str: str,
+    index_head_dim: int,
+    indexer_pad_dim: int | None = None,
+    sfa_dcp_replicated_indexer_size: int = 1,
+    c8_unified_pool: bool = False,
+    scale_dtype: torch.dtype | None = None,
+    kv_lora_rank: int | None = None,
+    qk_rope_head_dim: int | None = None,
+) -> "AscendSFAIndexerCacheSpec":
+    """Build the offload indexer spec as a separated ``AscendSFAIndexerCacheSpec``.
+
+    Mirrors pr-11647's non-offload indexer spec, plus the offload C8 unified-pool
+    ``page_bytes_per_token`` (int8 index + raw pad + one scale element) so
+    ``unify_kv_cache_spec_page_size`` still sees the 8:1 main:indexer page ratio.
+
+    Non-C8 uses the nominal ``head_size`` (index + pad) with bf16 page accounting.
+    C8 uses the truthful physical ``head_size = index_head_dim`` and ``scale_dim
+    = 1``; page accounting goes through ``page_bytes_per_token`` and no longer
+    depends on ``head_size``/``scale_dim``.
+    """
+    if indexer_pad_dim is None:
+        assert kv_lora_rank is not None and qk_rope_head_dim is not None
+        indexer_pad_dim = offload_indexer_pad_dim(
+            index_head_dim, qk_rope_head_dim, kv_lora_rank
+        )
+    page_bytes_per_token = None
+    cache_sparse_c8 = False
+    scale_dim = 0
+    resolved_scale_dtype: torch.dtype = torch.int8
+    resolved_head_size = head_size
+    if c8_unified_pool:
+        scale_dtype = scale_dtype or _get_c8_k_scale_cache_dtype()
+        page_bytes_per_token = offload_c8_indexer_bytes_per_token(
+            index_head_dim, indexer_pad_dim, scale_dtype
+        )
+        cache_sparse_c8 = True
+        scale_dim = 1
+        resolved_scale_dtype = scale_dtype
+        resolved_head_size = index_head_dim
+    return AscendSFAIndexerCacheSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=resolved_head_size,
+        dtype=dtype,
+        cache_dtype_str=cache_dtype_str,
+        scale_dim=scale_dim,
+        scale_dtype=resolved_scale_dtype,
+        cache_sparse_c8=cache_sparse_c8,
+        sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size,
+        page_bytes_per_token=page_bytes_per_token,
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class AscendSFAIndexerCacheSpec(FullAttentionSpec):
+    """KV cache spec for SFA indexer K/scale cache.
+
+    The scheduler should treat this as a full-attention-compatible cache so it
+    can share block ids with the MLA cache in the same UniformType group. The
+    model runner still allocates it as an independent physical cache tensor.
+    """
+
+    scale_dim: int = 0
+    scale_dtype: torch.dtype = torch.int8
+    cache_sparse_c8: bool = False
+    cache_dtype_str: str | None = None
+    sfa_dcp_replicated_indexer_size: int = 1
+    # SFA offload + LIC8 unified pool: precomputed bytes/token for page_size.
+    # When set, page_size_bytes = block_size * num_kv_heads * page_bytes_per_token,
+    # overriding real_page_size_bytes so the indexer can carry the C8 byte-mix
+    # layout (int8 index + raw pad + one scale element) that the uniform
+    # real_page_size_bytes formula cannot express. Offload path only.
+    page_bytes_per_token: int | None = None
+
+    @property
+    def page_size_bytes(self) -> int:
+        if self.page_bytes_per_token is not None:
+            return _offload_page_size_bytes(
+                self.block_size,
+                self.num_kv_heads,
+                self.page_bytes_per_token,
+            )
+        return self.real_page_size_bytes
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        num_heads_per_page = self.block_size * self.num_kv_heads
+        return (
+            self.sfa_dcp_replicated_indexer_size
+            * num_heads_per_page
+            * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, AscendSFAIndexerCacheSpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be AscendSFAIndexerCacheSpec."
+        )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        dtype_set = set(spec.dtype for spec in specs)
+        scale_dim_set = set(spec.scale_dim for spec in specs)
+        scale_dtype_set = set(spec.scale_dtype for spec in specs)
+        cache_sparse_c8_set = set(spec.cache_sparse_c8 for spec in specs)
+        sfa_dcp_replicated_indexer_size_set = set(spec.sfa_dcp_replicated_indexer_size for spec in specs)
+        page_bytes_per_token_set = set(spec.page_bytes_per_token for spec in specs)
+        assert (
+            len(cache_dtype_str_set) == 1
+            and len(dtype_set) == 1
+            and len(scale_dim_set) == 1
+            and len(scale_dtype_set) == 1
+            and len(cache_sparse_c8_set) == 1
+            and len(sfa_dcp_replicated_indexer_size_set) == 1
+            and len(page_bytes_per_token_set) == 1
+        ), (
+            "All SFA indexer cache layers in the same KV cache group must use "
+            "the same dtype, scale layout, quantization method, sparse C8 "
+            "setting, DCP replication size and offload page_bytes_per_token."
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            dtype=dtype_set.pop(),
+            cache_dtype_str=cache_dtype_str_set.pop(),
+            scale_dim=scale_dim_set.pop(),
+            scale_dtype=scale_dtype_set.pop(),
+            cache_sparse_c8=cache_sparse_c8_set.pop(),
+            sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size_set.pop(),
+            page_bytes_per_token=specs[0].page_bytes_per_token,
+        )
+
+
+def register_ascend_kv_cache_specs() -> None:
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendMLAAttentionSpec,
+        manager_class=CompressAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
+    )
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendSFAIndexerCacheSpec,
+        manager_class=FullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
+    )
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendSlidingWindowMLASpec,
+        manager_class=SlidingWindowManager,
+        uniform_type_base_spec=SlidingWindowMLASpec,
+    )
+    KVCacheSpecRegistry.register(
+        OffloadMLAAttentionSpec,
+        OffloadMLAAttentionManager,
+        uniform_type_base_spec=OffloadMLAAttentionSpec,
+    )

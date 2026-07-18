@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# clawd-term 启动器：开一个 tmux 会话，主窗格跑你的 shell（你在里面跑 claude），
+# 底部小窗格跑桌宠渲染器。状态由 Claude Code hooks 实时写入，桌宠随之变化。
+#
+# 用法（在一个【普通 shell】里执行，不要在 claude 会话里嵌套）：
+#   bash ~/.claude/pet/start.sh
+#
+# 进入后：在主窗格运行 claude；右下桌宠会随状态动。
+# 分离（保留后台）：Ctrl+B 然后按 D。重连：bash ~/.claude/pet/start.sh
+set -euo pipefail
+PET_DIR="${HOME}/.claude/pet"
+SESSION="clawd-pet"
+
+# 确保 state 目录存在、有初始状态
+mkdir -p "$PET_DIR"
+[ -f "$PET_DIR/state" ] || echo idle > "$PET_DIR/state"
+[ -f "$PET_DIR/ts" ] || date +%s > "$PET_DIR/ts"
+
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "未安装 tmux。先执行：apt-get install -y tmux" >&2
+    exit 1
+fi
+
+# 已有同 名 session 则直接 attach
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    exec tmux attach -t "$SESSION"
+fi
+
+# 新建 session（主窗格 = 登录 shell），底部 9 行窗格跑桌宠
+tmux new-session -d -s "$SESSION"
+tmux split-window -v -t "$SESSION":0.0 -l 9 "python3 ${PET_DIR}/pet.py; sh"
+tmux select-pane -t "$SESSION":0.0
+tmux send-keys -t "$SESSION":0.0 \
+    "echo '>>> 在这里运行 claude，桌宠在底部窗格随状态变化。'" Enter
+tmux attach -t "$SESSION"

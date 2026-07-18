@@ -1,0 +1,51 @@
+from typing import List
+
+
+class Solution:
+    def calc_page_fault_num(self, frame_num: int, window_size: int, pages: List[int]) -> int:
+        frames = {}          # frame_id -> {"fid","page_id","time","count"}
+        page_to_frame = {}   # page_id -> frame_id（当前缓存中的页）
+        time = 0
+        replace_count = 0
+
+        for page_id in pages:
+            time += 1
+
+            # 1) 命中：访问次数 +1，更新访问时间
+            if page_id in page_to_frame:
+                fid = page_to_frame[page_id]
+                frames[fid]["count"] += 1
+                frames[fid]["time"] = time
+                continue
+
+            # 2) 缺页
+            if len(frames) < frame_num:
+                # 有空闲页框：直接放入，不计置换
+                fid = len(frames)
+                frames[fid] = {"fid": fid, "page_id": page_id, "time": time, "count": 1}
+                page_to_frame[page_id] = fid
+            else:
+                # 无空闲页框：发生一次置换
+                # 先按访问时间取最早的 window_size 个作为过期候选
+                cand = sorted(frames.values(), key=lambda f: f["time"])[:window_size]
+                # 再在其中选访问次数最少的；并列时稳定排序保留时间顺序 → 最旧者优先
+                cand.sort(key=lambda f: f["count"])
+                victim = cand[0]
+
+                del page_to_frame[victim["page_id"]]     # 换出旧页
+                victim["page_id"] = page_id              # 新页占用该页框
+                victim["time"] = time
+                victim["count"] = 1
+                page_to_frame[page_id] = victim["fid"]
+                replace_count += 1
+
+        return replace_count
+
+
+if __name__ == "__main__":
+    sol = Solution()
+    # 样例1：3 个页框，windowSize=2
+    print(sol.calc_page_fault_num(3, 2, [51, 52, 53, 54, 54, 51, 52, 53, 54]))  # 4
+    # 题目内嵌测试
+    print(sol.calc_page_fault_num(3, 2,
+          [1, 2, 1, 2, 3, 4, 3, 4, 5, 5, 4, 3, 4, 3, 2, 1, 10, 20, 30, 50, 30, 20]))  # 9

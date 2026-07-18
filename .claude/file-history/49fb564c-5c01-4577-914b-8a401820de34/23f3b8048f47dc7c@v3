@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# clawd-term 启动器。
+#   bash ~/.claude/pet/start.sh          # 底部 mini 窗格（默认，只占 6 行）
+#   bash ~/.claude/pet/start.sh side      # 右侧窄边栏（claude 保持满高，桌宠靠右）
+#   bash ~/.claude/pet/start.sh big       # 底部大窗格（5 行大螃蟹，占 9 行）
+#
+# 进入后在主窗格运行 claude；桌宠随状态变化。
+# 分离保留后台：Ctrl+B 然后 D；重连：再跑一次本脚本。
+set -euo pipefail
+PET_DIR="${HOME}/.claude/pet"
+SESSION="clawd-pet"
+MODE="${1:-bottom}"
+
+mkdir -p "$PET_DIR"
+[ -f "$PET_DIR/state" ] || echo idle > "$PET_DIR/state"
+[ -f "$PET_DIR/ts" ] || date +%s > "$PET_DIR/ts"
+
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "未安装 tmux。先执行：apt-get install -y tmux" >&2
+    exit 1
+fi
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    exec tmux attach -t "$SESSION"
+fi
+
+tmux new-session -d -s "$SESSION"
+case "$MODE" in
+    side)
+        # 右侧窄边栏，宽 18 列，满高；mini 螃蟹居中
+        tmux split-window -h -t "$SESSION":0.0 -l 18 "PET_SIZE=mini python3 ${PET_DIR}/pet.py; sh"
+        ;;
+    big)
+        tmux split-window -v -t "$SESSION":0.0 -l 9 "PET_SIZE=big python3 ${PET_DIR}/pet.py; sh"
+        ;;
+    bottom|*)
+        # 底部 mini 窗格，6 行
+        tmux split-window -v -t "$SESSION":0.0 -l 6 "PET_SIZE=mini python3 ${PET_DIR}/pet.py; sh"
+        ;;
+esac
+tmux select-pane -t "$SESSION":0.0
+tmux send-keys -t "$SESSION":0.0 \
+    "echo '>>> 在这里运行 claude，桌宠会随状态变化。'" Enter
+tmux attach -t "$SESSION"

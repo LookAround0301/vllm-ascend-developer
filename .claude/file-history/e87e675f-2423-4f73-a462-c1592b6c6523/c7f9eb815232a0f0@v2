@@ -1,0 +1,42 @@
+# Plan: Migrate offload (`use_offload=True`) SFA indexer to separated `AscendSFAIndexerCacheSpec`
+
+## Context
+
+pr-11647 introduced a **separated indexer KV-cache spec** (`AscendSFAIndexerCacheSpec`, managed by `FullAttentionManager`, uniform-type `FullAttentionSpec`) for the **non-offload** sparse path — already merged. The **offload** path (`ascend_config.use_offload=True`, SFA decode offload via `SFAKVOffloadConnector`) still builds the indexer as a **packed `AscendMLAAttentionSpec`** (`make_offload_indexer_mla_spec`), with the indexer K **aliased into the MLA unified-pool buffer** (`dsa_k_cache = raw_k_tensor.view(...)`, `model_runner_v1.py:4883`; comment `:4895-4897` "a physical page is either main or index, never both at once").
+
+**Goal:** make the offload indexer use pr's separated `AscendSFAIndexerCacheSpec` structure — **fully separate group/tensor/allocation, no aliasing with MLA** — so both paths share one indexer scheme; rewire the offload MLA tuple assembly so the SFA attention impl stays unchanged.
+
+**Confirmed safe (from exploration):** runtime consumers — `sfa_v1.py`, `sfa_kv_offload_worker.py`, `offload_kv_cache_layout.py`, the whole `ascend_store/` connector — read **only the tensor tuple layout (positions 0–5, len 5/6) and `page_size_bytes`**, never the spec type. So they stay untouched as long as the MLA layer still yields the 5/6-tuple `(main_k, main_v, indexer_k, resident_k, resident_v[, indexer_scale])`. The 8:1 main:indexer page ratio (for `unify_kv_cache_spec_page_size`) is preserved exactly by giving `AscendSFAIndexerCacheSpec` a `page_bytes_per_token` override (same pattern as `OffloadMLAAttentionSpec`/`AscendMLAAttentionSpec`).
+
+## Approach (decided: fully separate indexer)
+
+The indexer becomes its own `AscendSFAIndexerCacheSpec` group/tensor with its own raw allocation `(k[, scale])`, and the offload MLA reshape fetches the indexer's raw tensor cross-layer to fill tuple position 2.
+
+## Changes
+
+### `vllm_ascend/core/kv_cache_interface.py`
+1. **`AscendSFAIndexerCacheSpec` (`:516-577`)** — add `page_bytes_per_token: int | None = None` field; in `page_size_bytes` return `_offload_page_size_bytes(block_size, num_kv_heads, page_bytes_per_token)` when set, else current `real_page_size_bytes`; thread through `merge()` (single-valued assert + forward). Mirrors `OffloadMLAAttentionSpec.page_bytes_per_token` (`:389-398`).
+2. **`make_offload_indexer_mla_spec` (`:467-513`)** — change return type to `AscendSFAIndexerCacheSpec`. C8: `page_bytes_per_token = offload_c8_indexer_bytes_per_token(index_head_dim, indexer_pad_dim, scale_dtype)` (=146 B/token for DSV3.2/GLM5.2), truthful `head_size=index_head_dim`, `scale_dim=1`, `scale_dtype=_get_c8_k_scale_cache_dtype()`, `cache_sparse_c8=True`, `sfa_dcp_replicated_indexer_size` from caller. Non-C8: `head_size=index_head_dim+pad`, `scale_dim=0`. Drop `sparse_head_dim` (new spec has none; `sparse_kv_cache_has_indexer` detects via isinstance).
+
+### `vllm_ascend/worker/model_runner_v1.py`
+3. **`get_kv_cache_spec` offload indexer (`:5478-5499`)** — call the new `AscendSFAIndexerCacheSpec`-returning builder (mirror non-offload `:5567-5577`, plus offload `page_bytes_per_token` + `sfa_dcp_replicated_indexer_size` + pad-aware head_size).
+4. **`_allocate_kv_cache_tensors` indexer-skip (`:4538-4539`)** — remove `if self.use_offload and 'indexer' in layer_name: continue` so the indexer reaches the **existing** separated allocator at `:4571` (`elif isinstance(..., AscendSFAIndexerCacheSpec)`), which already builds the indexer raw `(k[, scale])` via `_allocate_sparse_c8_indexer_tensors`/`_allocate_int8_cache_tensor`. No change to that allocator.
+5. **`_allocate_kv_cache_tensors` MLA offload branch (`:4614-4729`)** — vLLM now auto-groups the indexer (`AscendSFAIndexerCacheSpec`) apart from MLA (`OffloadMLAAttentionSpec`), so the MLA `shared_by` no longer contains the indexer. Verify the MLA raw sizing **drops the indexer-scale portion** (scale moves to the indexer tensor at `:4571`); keep the MLA `c8_layout`/`page_bytes_per_token=1168` page accounting for the 8:1 unify. Remove the indexer-scale append from the MLA `raw_entry`.
+6. **`_reshape_kv_cache_tensors` offload branch (`:4802-4910`) — the crux.** Split:
+   - Gate `:4802` to MLA only: `if self.use_sparse and self.use_offload and not isinstance(current_kv_cache_spec, AscendSFAIndexerCacheSpec):`. Indexer layers then fall through to the separated reshape at `:4965` (`elif isinstance(current_kv_cache_spec, AscendSFAIndexerCacheSpec)`) → `kv_caches[indexer_name] = (indexer_k_cache[, scale])`.
+   - In the MLA reshape, replace the aliased `dsa_k_cache = raw_k_tensor.view(...)` (`:4883`) with a **cross-layer fetch**: derive `indexer_name` from MLA `layer_name` (convention `model.layers.{N}.self_attn.attn` → `model.layers.{N}.self_attn.indexer.k_cache`), read `indexer_raw = kv_cache_raw_tensors[indexer_name]`, build `dsa_k_cache` (+ `dsa_k_scale_cache` for C8) from the indexer raw. All raw tensors are allocated before reshape, so the cross-layer read is safe regardless of group order. Keep `topk_buffer_k/v` (resident scratch) at positions 3/4 and the 5/6-tuple assembly unchanged → `sfa_v1.py` sees the identical tuple.
+
+### `vllm_ascend/utils.py`
+7. **`sparse_kv_cache_has_indexer` (`:1721-1735`)** — the `sparse_head_dim` branch becomes dead for the indexer (now detected via `isinstance(..., AscendSFAIndexerCacheSpec)`). Optionally simplify; keep the `sparse_head_dim` fallback for safety. No behavior change.
+
+### Backend selection (verify, likely no change)
+8. **`initialize_attn_backend` (`:5352`, `:5390`)** — with the indexer as `AscendSFAIndexerCacheSpec`, `:5352` routes it to `AscendSFAIndexerBackend`; confirm `:5390` (`if 'indexer' in layer_names[0]: continue`) still handles the indexer group correctly for offload (matches pr's non-offload behavior).
+
+## Key risk
+Spots 5–6: the current design aliases indexer K into the MLA unified-pool buffer; Approach B drops that aliasing and gives the indexer its own buffer. Must verify on-NPU that the SFA decode offload still produces correct indexer K and that the 8:1 page accounting holds across the now-separate MLA and indexer tensors.
+
+## Verification
+1. `python3 -m pytest tests/ut/worker/a2/test_model_runner_v1.py tests/ut/attention/test_indexer.py tests/ut/ops/test_mla.py -q` — all 22 existing tests still pass.
+2. Add/extend UTs in `tests/ut/worker/a2/test_model_runner_v1.py` for an **offload** indexer (`use_offload=True`): assert spec type = `AscendSFAIndexerCacheSpec`, `page_size_bytes` honors the 8:1 ratio, and the MLA layer's 5/6-tuple position 2 is the (separately-allocated) indexer K view.
+3. `bash format.sh ci` (ruff + format) before push — not available in this env.
+4. On-NPU: run `decode_kv_offload.sh` (`use_offload=True` — the path this migration targets) and `prefill_kv_offload_lxs.sh`; verify indexer K layout, precision vs a known-good baseline, and that the SFA offload worker still offloads main K/V correctly.
