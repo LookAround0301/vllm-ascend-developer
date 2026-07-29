@@ -1,0 +1,9 @@
+# Keep source, documentation, and configuration files portable across platforms.
+* text=auto eol=lf
+
+# Windows command scripts require CRLF for cmd.exe compatibility.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Do not apply text conversion to repository binary assets.
+*.webp -text

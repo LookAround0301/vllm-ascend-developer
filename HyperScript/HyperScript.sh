@@ -34,9 +34,8 @@ DEFAULT_VLLM_ASCEND_INSTALL_DIR="$(pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ==================== Claude Code 配置 ====================
-# x86: linux-x64
+# Node.js 安装包的平台由当前系统的 uname 自动检测。
 DEFAULT_NODE_VERSION="v24.14.0"
-DEFAULT_NODE_ARCH="linux-arm64"
 DEFAULT_NODE_MIRROR_BASE="https://mirrors.huaweicloud.com/nodejs"
 # 备选 npm 镜像源（按需取消注释）：
 # npm config set registry https://mirrors.tools.huawei.com/npm/
@@ -45,6 +44,11 @@ DEFAULT_NODE_MIRROR_BASE="https://mirrors.huaweicloud.com/nodejs"
 # npm config set registry https://mirrors.huaweicloud.com/repository/npm/
 DEFAULT_NPM_REGISTRY="https://registry.npmmirror.com"
 DEFAULT_CLAUDE_CODE_INSTALL_DIR="$(pwd)"
+
+# ==================== Codex CLI 配置 ====================
+DEFAULT_CODEX_INSTALL_DIR="$(pwd)"
+CODEX_PACKAGE="@openai/codex"
+DEFAULT_CODEX_BASE_URL="https://api.openai.com/v1"
 
 # ==================== 通用工具函数 ====================
 
@@ -108,6 +112,49 @@ ensure_dir() {
             exit 1
         fi
     fi
+}
+
+# 输出当前系统对应的 Node.js 发布包平台标识，例如 linux-x64 或 darwin-arm64。
+# 可选参数用于测试：detect_node_platform [系统名] [机器架构]。
+detect_node_platform() {
+    local system_name="${1:-$(uname -s)}"
+    local machine_arch="${2:-$(uname -m)}"
+    local node_os node_arch
+
+    case "${system_name}" in
+        Linux)
+            node_os="linux"
+            ;;
+        Darwin)
+            node_os="darwin"
+            ;;
+        *)
+            >&2 log_error "不支持的操作系统：${system_name}。Node.js 自动安装仅支持 Linux 和 macOS。"
+            return 1
+            ;;
+    esac
+
+    case "${machine_arch}" in
+        x86_64|amd64)
+            node_arch="x64"
+            ;;
+        aarch64|arm64)
+            node_arch="arm64"
+            ;;
+        armv7l)
+            if [ "${node_os}" != "linux" ]; then
+                >&2 log_error "Node.js 没有 ${node_os}-armv7l 发布包。"
+                return 1
+            fi
+            node_arch="armv7l"
+            ;;
+        *)
+            >&2 log_error "不支持的 CPU 架构：${machine_arch}。"
+            return 1
+            ;;
+    esac
+
+    printf '%s-%s\n' "${node_os}" "${node_arch}"
 }
 
 # 确认是否继续（y/n，默认y），输入 n 则 return 0 中断调用方
@@ -853,23 +900,26 @@ install_claude_code() {
 
     echo -e "${GREEN}── 安装 Claude Code ──${NC}"
 
-    # 默认值
+    # 根据当前操作系统和 CPU 架构选择 Node.js 发布包。
     local NODE_VERSION="${DEFAULT_NODE_VERSION}"
-    local NODE_ARCH="${DEFAULT_NODE_ARCH}"
-    local NODE_FILENAME="node-${NODE_VERSION}-${NODE_ARCH}.tar.gz"
+    local NODE_PLATFORM
+    if ! NODE_PLATFORM="$(detect_node_platform)"; then
+        return 1
+    fi
+    local NODE_FILENAME="node-${NODE_VERSION}-${NODE_PLATFORM}.tar.gz"
     local NODE_DOWNLOAD_URL="${DEFAULT_NODE_MIRROR_BASE}/${NODE_VERSION}/${NODE_FILENAME}"
     local NPM_REGISTRY="${DEFAULT_NPM_REGISTRY}"
     # 获取工作目录
     local work_dir="${install_dir}"
     local node_env_dir="${work_dir}/claude_code_env"
     local node_archive_path="${node_env_dir}/${NODE_FILENAME}"
-    local node_extract_dir="${node_env_dir}/node-${NODE_VERSION}-${NODE_ARCH}"
+    local node_extract_dir="${node_env_dir}/node-${NODE_VERSION}-${NODE_PLATFORM}"
     local node_bin_dir="${node_extract_dir}/bin"
 
     ensure_dir "${node_env_dir}"
 
     # 打印安装配置
-    log_info "目录：${work_dir} | Node：${NODE_VERSION} (${NODE_ARCH}) | npm 源：${NPM_REGISTRY}"
+    log_info "目录：${work_dir} | Node：${NODE_VERSION} (${NODE_PLATFORM}) | npm 源：${NPM_REGISTRY}"
 
     local confirm_install
     while true; do
@@ -1045,6 +1095,653 @@ EOF
     fi
 }
 
+# ==================== Codex CLI 安装函数 ====================
+
+# 测试 Codex 中转 URL，并记录 curl 结果供后续分类提示使用
+codex_probe_relay_url() {
+    local relay_url="$1"
+    local curl_error_file
+    local probe_output
+
+    CODEX_CURL_EXIT=0
+    CODEX_CURL_HTTP_CODE="000"
+    CODEX_CURL_EFFECTIVE_URL=""
+    CODEX_CURL_REDIRECT_URL=""
+    CODEX_CURL_REMOTE_IP=""
+    CODEX_CURL_SSL_VERIFY_RESULT=""
+    CODEX_CURL_ERROR=""
+
+    curl_error_file="$(mktemp)" || {
+        CODEX_CURL_EXIT=2
+        CODEX_CURL_ERROR="无法创建 curl 临时错误文件"
+        return 2
+    }
+
+    probe_output="$(curl --location --silent --show-error \
+        --connect-timeout 10 --max-time 20 --max-redirs 10 \
+        --output /dev/null \
+        --write-out '%{http_code}\t%{url_effective}\t%{redirect_url}\t%{remote_ip}\t%{ssl_verify_result}' \
+        "${relay_url}" 2>"${curl_error_file}")"
+    CODEX_CURL_EXIT=$?
+
+    IFS=$'\t' read -r CODEX_CURL_HTTP_CODE \
+        CODEX_CURL_EFFECTIVE_URL CODEX_CURL_REDIRECT_URL \
+        CODEX_CURL_REMOTE_IP CODEX_CURL_SSL_VERIFY_RESULT <<< "${probe_output}"
+    CODEX_CURL_HTTP_CODE="${CODEX_CURL_HTTP_CODE:-000}"
+    CODEX_CURL_ERROR="$(tr '\n\r' '  ' < "${curl_error_file}")"
+    CODEX_CURL_ERROR="${CODEX_CURL_ERROR:0:240}"
+    rm -f "${curl_error_file}"
+
+    return "${CODEX_CURL_EXIT}"
+}
+
+# 判断 curl 失败是否由证书或系统 CA 信任问题引起
+codex_relay_ssl_error() {
+    case "${CODEX_CURL_EXIT:-0}" in
+        35|60|77)
+            return 0
+            ;;
+    esac
+
+    case "${CODEX_CURL_ERROR:-}" in
+        *certificate*|*Certificate*|*SSL*|*CAfile*|*self-signed*|*unable\ to\ get\ local\ issuer*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# 解析中转 URL 的主机和端口，支持默认 HTTPS 端口及 IPv6 字面量
+codex_parse_relay_endpoint() {
+    local relay_url="$1"
+    local authority remainder
+
+    authority="${relay_url#*://}"
+    authority="${authority%%/*}"
+    authority="${authority%%\?*}"
+    authority="${authority%%#*}"
+    authority="${authority##*@}"
+
+    CODEX_RELAY_HOST=""
+    CODEX_RELAY_PORT=""
+
+    if [[ "${authority}" == \[*\]* ]]; then
+        CODEX_RELAY_HOST="${authority%%\]*}"
+        CODEX_RELAY_HOST="${CODEX_RELAY_HOST#\[}"
+        remainder="${authority#*\]}"
+        if [[ "${remainder}" == :* ]]; then
+            CODEX_RELAY_PORT="${remainder#:}"
+        else
+            CODEX_RELAY_PORT="443"
+        fi
+    elif [[ "${authority}" == *:* ]]; then
+        CODEX_RELAY_HOST="${authority%%:*}"
+        CODEX_RELAY_PORT="${authority##*:}"
+    else
+        CODEX_RELAY_HOST="${authority}"
+        CODEX_RELAY_PORT="443"
+    fi
+
+    if [ -z "${CODEX_RELAY_HOST}" ] \
+        || ! [[ "${CODEX_RELAY_PORT}" =~ ^[0-9]+$ ]] \
+        || [ "${CODEX_RELAY_PORT}" -lt 1 ] \
+        || [ "${CODEX_RELAY_PORT}" -gt 65535 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# 解码代理 URL 中的用户名和密码（与 ssl.sh 的处理方式一致）
+codex_url_decode() {
+    local encoded="${1//+/ }"
+    printf '%b' "${encoded//%/\\x}"
+}
+
+# 提取证书 SHA-256 指纹，用于避免重复安装
+codex_cert_fingerprint() {
+    local cert_file="$1"
+    openssl x509 -in "${cert_file}" -noout -fingerprint -sha256 2>/dev/null \
+        | awk -F= 'NF > 1 {print $2}' \
+        | tr -d ':' \
+        | tr '[:lower:]' '[:upper:]'
+}
+
+# 集成 ssl.sh 的证书获取流程，直接在 HyperScript 内获取并安装中转站 CA
+codex_fetch_relay_certificate() {
+    local relay_url="$1"
+    local proxy_var proxy_raw="" proxy_src="" proxy_url=""
+    local proxy_auth="" proxy_addr="" proxy_host="" proxy_port=""
+    local proxy_remainder proxy_user="" proxy_pass=""
+    local openssl_help
+    local connect_target
+    local cert_temp_dir all_certs openssl_output openssl_error
+    local openssl_exit=0
+    local ca_dir="" ca_update_cmd=""
+    local cert_file subject issuer fingerprint target_cert
+    local installed_count=0
+    local -a openssl_proxy_args=()
+
+    if [[ "${relay_url}" != https://* ]]; then
+        log_info "中转 URL 使用 HTTP，跳过 SSL 证书获取"
+        return 0
+    fi
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        log_warn "当前环境未安装 openssl，无法自动获取中转站证书"
+        return 1
+    fi
+
+    if ! codex_parse_relay_endpoint "${relay_url}"; then
+        log_warn "无法解析中转 URL 的主机或端口，跳过证书获取"
+        return 1
+    fi
+
+    # 复用 ssl.sh 的代理选择顺序，确保 openssl 与 curl 走同一条网络路径。
+    for proxy_var in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy; do
+        if [ -n "${!proxy_var:-}" ]; then
+            proxy_raw="${!proxy_var}"
+            proxy_src="${proxy_var}"
+            break
+        fi
+    done
+
+    if [ -n "${proxy_raw}" ]; then
+        proxy_url="${proxy_raw#http://}"
+        proxy_url="${proxy_url#https://}"
+        proxy_url="${proxy_url%/}"
+
+        if [[ "${proxy_url}" == *@* ]]; then
+            proxy_auth="${proxy_url%@*}"
+            proxy_addr="${proxy_url##*@}"
+        else
+            proxy_addr="${proxy_url}"
+        fi
+        proxy_addr="${proxy_addr%%/*}"
+
+        if [[ "${proxy_addr}" == \[*\]* ]]; then
+            proxy_host="${proxy_addr%%\]*}"
+            proxy_host="${proxy_host#\[}"
+            proxy_remainder="${proxy_addr#*\]}"
+            if [[ "${proxy_remainder}" == :* ]]; then
+                proxy_port="${proxy_remainder#:}"
+            fi
+        elif [[ "${proxy_addr}" == *:* ]]; then
+            proxy_host="${proxy_addr%%:*}"
+            proxy_port="${proxy_addr##*:}"
+        else
+            proxy_host="${proxy_addr}"
+        fi
+
+        if [ -z "${proxy_port}" ]; then
+            if [[ "${proxy_raw}" == https://* ]]; then
+                proxy_port="443"
+            else
+                proxy_port="80"
+            fi
+        fi
+
+        if [ -z "${proxy_host}" ] || ! [[ "${proxy_port}" =~ ^[0-9]+$ ]]; then
+            log_warn "无法解析 ${proxy_src} 代理地址，跳过证书获取"
+            return 1
+        fi
+
+        openssl_help="$(openssl s_client -help 2>&1 || true)"
+        if ! grep -qE '(^|[[:space:]])-proxy([[:space:]]|$)' <<< "${openssl_help}"; then
+            log_warn "当前 openssl 不支持 s_client -proxy，无法通过 ${proxy_src} 获取证书"
+            return 1
+        fi
+        openssl_proxy_args=(-proxy "${proxy_host}:${proxy_port}")
+
+        if [ -n "${proxy_auth}" ]; then
+            if [[ "${proxy_auth}" != *:* ]]; then
+                log_warn "${proxy_src} 代理认证格式无效，跳过证书获取"
+                return 1
+            fi
+            proxy_user="$(codex_url_decode "${proxy_auth%%:*}")"
+            proxy_pass="$(codex_url_decode "${proxy_auth#*:}")"
+            if [ -z "${proxy_user}" ] || [ -z "${proxy_pass}" ]; then
+                log_warn "无法解析 ${proxy_src} 的代理用户名或密码，跳过证书获取"
+                return 1
+            fi
+            if grep -q -- '-proxy_user' <<< "${openssl_help}"; then
+                openssl_proxy_args+=(-proxy_user "${proxy_user}" -proxy_pass "pass:${proxy_pass}")
+            else
+                log_warn "当前 openssl 不支持代理认证参数，将尝试无认证连接"
+                openssl_proxy_args=(-proxy "${proxy_host}:${proxy_port}")
+            fi
+        fi
+    fi
+
+    connect_target="${CODEX_RELAY_HOST}:${CODEX_RELAY_PORT}"
+    if [[ "${CODEX_RELAY_HOST}" == *:* ]]; then
+        connect_target="[${CODEX_RELAY_HOST}]:${CODEX_RELAY_PORT}"
+    fi
+
+    cert_temp_dir="$(mktemp -d)" || {
+        log_warn "无法创建证书临时目录，跳过证书获取"
+        return 1
+    }
+    all_certs="${cert_temp_dir}/all_certs.pem"
+    openssl_output="${cert_temp_dir}/openssl.out"
+    openssl_error="${cert_temp_dir}/openssl.err"
+
+    log_warn "检测到 SSL 证书问题，正在获取 ${relay_url} 的证书..."
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 15 openssl s_client "${openssl_proxy_args[@]}" \
+            -connect "${connect_target}" \
+            -servername "${CODEX_RELAY_HOST}" \
+            -showcerts </dev/null > "${openssl_output}" 2>"${openssl_error}" \
+            || openssl_exit=$?
+    else
+        openssl s_client "${openssl_proxy_args[@]}" \
+            -connect "${connect_target}" \
+            -servername "${CODEX_RELAY_HOST}" \
+            -showcerts </dev/null > "${openssl_output}" 2>"${openssl_error}" \
+            || openssl_exit=$?
+    fi
+
+    sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' \
+        "${openssl_output}" > "${all_certs}"
+    if [ ! -s "${all_certs}" ]; then
+        log_warn "未获取到 ${relay_url} 的证书链，openssl 退出码 ${openssl_exit}"
+        tail -n 3 "${openssl_error}" 2>/dev/null | sed 's/^/  /'
+        rm -rf "${cert_temp_dir}"
+        return 1
+    fi
+
+    awk -v out_dir="${cert_temp_dir}" '
+        /-----BEGIN CERTIFICATE-----/ {
+            n++;
+            f=sprintf("%s/cert-%02d.pem", out_dir, n)
+        }
+        {
+            if (f) print > f
+        }
+        /-----END CERTIFICATE-----/ {
+            close(f)
+            f=""
+        }
+    ' "${all_certs}"
+
+    if command -v update-ca-trust >/dev/null 2>&1 \
+        && [ -d /etc/pki/ca-trust/source/anchors ]; then
+        ca_dir="/etc/pki/ca-trust/source/anchors"
+        ca_update_cmd="update-ca-trust"
+    elif command -v update-ca-certificates >/dev/null 2>&1; then
+        ca_dir="/usr/local/share/ca-certificates"
+        ca_update_cmd="update-ca-certificates"
+    elif [ -d /etc/pki/ca-trust/source/anchors ]; then
+        ca_dir="/etc/pki/ca-trust/source/anchors"
+    else
+        ca_dir="/usr/local/share/ca-certificates"
+    fi
+
+    if ! mkdir -p "${ca_dir}" 2>/dev/null || [ ! -w "${ca_dir}" ]; then
+        log_warn "无法写入系统 CA 目录 ${ca_dir}，请检查权限"
+        rm -rf "${cert_temp_dir}"
+        return 1
+    fi
+
+    shopt -s nullglob
+    for cert_file in "${cert_temp_dir}"/cert-*.pem; do
+        subject="$(openssl x509 -in "${cert_file}" -noout -subject 2>/dev/null | sed 's/^subject=//')"
+        issuer="$(openssl x509 -in "${cert_file}" -noout -issuer 2>/dev/null | sed 's/^issuer=//')"
+        if [ -z "${subject}" ] || [ "${subject}" != "${issuer}" ]; then
+            continue
+        fi
+
+        fingerprint="$(codex_cert_fingerprint "${cert_file}")"
+        [ -n "${fingerprint}" ] || continue
+        target_cert="${ca_dir}/proxy-ca-${fingerprint}.crt"
+        if [ -f "${target_cert}" ]; then
+            continue
+        fi
+
+        if cp "${cert_file}" "${target_cert}"; then
+            installed_count=$((installed_count + 1))
+            log_info "已安装中转站 CA：${fingerprint}"
+        else
+            log_warn "写入 CA 失败：${target_cert}"
+        fi
+    done
+    shopt -u nullglob
+
+    if [ "${installed_count}" -eq 0 ]; then
+        log_warn "证书链中未发现新的自签名 CA，系统信任库未修改"
+        rm -rf "${cert_temp_dir}"
+        return 1
+    fi
+
+    if [ "${ca_update_cmd}" = "update-ca-trust" ]; then
+        if ! update-ca-trust extract; then
+            log_warn "update-ca-trust 更新失败"
+            rm -rf "${cert_temp_dir}"
+            return 1
+        fi
+    elif [ "${ca_update_cmd}" = "update-ca-certificates" ]; then
+        if ! update-ca-certificates; then
+            log_warn "update-ca-certificates 更新失败"
+            rm -rf "${cert_temp_dir}"
+            return 1
+        fi
+    else
+        log_warn "未找到系统 CA 更新命令，已写入 CA 文件但可能尚未生效"
+    fi
+
+    rm -rf "${cert_temp_dir}"
+    log_success "中转站证书获取/更新完成"
+    return 0
+}
+
+# 按 curl 退出码和 HTTP 状态报告中转站在当前环境的可用性
+codex_report_relay_result() {
+    local relay_url="$1"
+    local curl_exit="${CODEX_CURL_EXIT:-1}"
+    local http_code="${CODEX_CURL_HTTP_CODE:-000}"
+    local effective_url="${CODEX_CURL_EFFECTIVE_URL:-}"
+    local error_message="${CODEX_CURL_ERROR:-未知 curl 错误}"
+
+    if [ "${curl_exit}" -ne 0 ]; then
+        case "${curl_exit}" in
+            6)
+                log_error "中转站不可用：curl 无法解析域名（退出码 6）"
+                ;;
+            7)
+                log_error "中转站不可用：curl 无法连接目标主机（退出码 7）"
+                ;;
+            28)
+                log_error "中转站不可用：curl 连接或请求超时（退出码 28）"
+                ;;
+            35|60|77)
+                log_error "中转站不可用：SSL/TLS 或系统 CA 证书校验失败（curl 退出码 ${curl_exit}）"
+                ;;
+            *)
+                log_error "中转站不可用：curl 退出码 ${curl_exit}，${error_message}"
+                ;;
+        esac
+        return 1
+    fi
+
+    if [ "${http_code}" = "504" ]; then
+        log_error "中转站不可用：HTTP 504 Gateway Timeout"
+        log_warn "如果该中转站位于内网，这通常表示当前环境无访问权限，请求已被防火墙重定向。"
+        log_warn "这属于网络/防火墙问题，不是 API Key 校验失败。"
+        if [ -n "${effective_url}" ] && [ "${effective_url}" != "${relay_url}" ]; then
+            log_warn "curl 最终响应地址：${effective_url}"
+        fi
+        return 1
+    fi
+
+    case "${http_code}" in
+        2??)
+            log_success "中转站在当前环境可用（HTTP ${http_code}）"
+            ;;
+        3??)
+            log_warn "中转站可访问，但最终返回 HTTP ${http_code}，请确认重定向后的地址是否为有效 API 地址"
+            ;;
+        401|403)
+            log_warn "中转站在当前环境可访问（HTTP ${http_code}），但需要有效 API Key 或当前请求被拒绝"
+            ;;
+        404|405)
+            log_warn "中转站主机在当前环境可访问，但 URL 路径可能不正确（HTTP ${http_code}）"
+            ;;
+        5??)
+            log_error "中转站当前不可用：服务端返回 HTTP ${http_code}"
+            ;;
+        000)
+            log_error "中转站不可用：curl 未获得 HTTP 响应（${error_message}）"
+            ;;
+        *)
+            log_warn "中转站返回未分类的 HTTP 状态：${http_code}"
+            ;;
+    esac
+
+    [[ "${http_code}" == 2?? || "${http_code}" == "401" || "${http_code}" == "403" ]]
+}
+
+# URL 首次测试失败且确认为证书问题时，获取证书后再次测试
+codex_check_relay_url() {
+    local relay_url="$1"
+
+    log_info "正在测试中转 URL 可用性..."
+    codex_probe_relay_url "${relay_url}" || true
+
+    if codex_relay_ssl_error; then
+        codex_fetch_relay_certificate "${relay_url}" || true
+        log_info "证书处理完成，重新测试中转 URL..."
+        codex_probe_relay_url "${relay_url}" || true
+    else
+        log_info "curl 未检测到 SSL 证书错误，跳过证书获取"
+    fi
+
+    codex_report_relay_result "${relay_url}"
+}
+
+# 安装 Codex CLI（Node.js + npm，含多源回退）
+install_codex_cli() {
+    local install_dir="${1:-$DEFAULT_CODEX_INSTALL_DIR}"
+
+    echo -e "${GREEN}── 安装 Codex CLI ──${NC}"
+
+    local NODE_VERSION="${DEFAULT_NODE_VERSION}"
+    local NODE_PLATFORM
+    if ! NODE_PLATFORM="$(detect_node_platform)"; then
+        return 1
+    fi
+    local NODE_FILENAME="node-${NODE_VERSION}-${NODE_PLATFORM}.tar.gz"
+    local NODE_DOWNLOAD_URL="${DEFAULT_NODE_MIRROR_BASE}/${NODE_VERSION}/${NODE_FILENAME}"
+    local NPM_REGISTRY="${DEFAULT_NPM_REGISTRY}"
+    local work_dir="${install_dir}"
+    local node_env_dir="${work_dir}/codex_cli_env"
+    local node_archive_path="${node_env_dir}/${NODE_FILENAME}"
+    local node_extract_dir="${node_env_dir}/node-${NODE_VERSION}-${NODE_PLATFORM}"
+    local node_bin_dir="${node_extract_dir}/bin"
+
+    ensure_dir "${node_env_dir}"
+
+    log_info "目录：${work_dir} | Node：${NODE_VERSION} (${NODE_PLATFORM}) | npm 源：${NPM_REGISTRY}"
+
+    local confirm_install
+    while true; do
+        read -e -p "确认开始安装？(y/n，默认y)：" confirm_install
+        confirm_install=$(echo "${confirm_install}" | xargs || echo "y")
+        confirm_install=${confirm_install:-y}
+        confirm_install=$(echo "${confirm_install}" | tr 'A-Z' 'a-z')
+        if [[ "${confirm_install}" =~ ^[YyNn]$ ]]; then
+            break
+        else
+            log_error "输入无效！请输入 y 或 n"
+        fi
+    done
+
+    if [ "${confirm_install}" != "y" ]; then
+        log_info "已取消安装"
+        return 0
+    fi
+
+    # ===== Step 1/4: 下载 Node.js =====
+    echo -e "\n${GREEN}── [1/4] 下载 Node.js ──${NC}"
+
+    if [ -f "${node_archive_path}" ]; then
+        log_info "Node.js 压缩包已存在：${node_archive_path}"
+    else
+        log_info "正在下载 Node.js ${NODE_VERSION}..."
+
+        if wget --no-check-certificate -O "${node_archive_path}" "${NODE_DOWNLOAD_URL}"; then
+            log_success "Node.js 下载成功"
+        else
+            log_fail "Node.js 下载失败"
+            rm -f "${node_archive_path}"
+            return 1
+        fi
+    fi
+
+    # ===== Step 2/4: 解压 Node.js + 配置环境变量 =====
+    echo -e "\n${GREEN}── [2/4] 解压 Node.js 并配置环境变量 ──${NC}"
+
+    if [ -d "${node_extract_dir}" ]; then
+        log_info "Node.js 已解压，跳过"
+    else
+        log_info "正在解压 Node.js..."
+        tar -xf "${node_archive_path}" -C "${node_env_dir}"
+        if [ $? -eq 0 ]; then
+            log_success "Node.js 解压成功"
+        else
+            log_fail "Node.js 解压失败"
+            return 1
+        fi
+    fi
+
+    sed -i '/# Codex CLI 环境变量（由安装脚本添加）/,+2d' ~/.bashrc 2>/dev/null || true
+    echo -e "\n# Codex CLI 环境变量（由安装脚本添加）" >> ~/.bashrc
+    echo "export PATH=${node_bin_dir}:\$PATH" >> ~/.bashrc
+    echo "export NODE_TLS_REJECT_UNAUTHORIZED=0" >> ~/.bashrc
+
+    export PATH=${node_bin_dir}:$PATH
+    export NODE_TLS_REJECT_UNAUTHORIZED=0
+
+    if node -v > /dev/null 2>&1; then
+        log_success "Node.js $(node -v) / npm $(npm -v)"
+    else
+        log_error "❌ Node.js 验证失败，检查 PATH 设置"
+        log_info "Node.js 路径: ${node_bin_dir}"
+        ls -la "${node_bin_dir}/" 2>/dev/null || log_error "目录不存在: ${node_bin_dir}"
+        return 1
+    fi
+
+    # ===== Step 3/4: 安装 Codex CLI =====
+    echo -e "\n${GREEN}── [3/4] 安装 Codex CLI ──${NC}"
+
+    log_info "配置 npm 镜像源..."
+    npm config set strict-ssl false
+    npm config set registry "${NPM_REGISTRY}"
+    npm cache clean -f 2>/dev/null || true
+
+    log_info "正在安装 Codex CLI（可能耗时 30-60 秒）..."
+
+    if npm install -g "${CODEX_PACKAGE}" --verbose; then
+        log_success "Codex CLI 安装成功"
+    else
+        log_warn "⚠️ 淘宝源安装失败，尝试切换腾讯云源..."
+        npm config set registry "http://mirrors.cloud.tencent.com/npm/"
+        if npm install -g "${CODEX_PACKAGE}" --verbose; then
+            log_success "Codex CLI 安装成功（腾讯云源）"
+        else
+            log_warn "⚠️ 腾讯云源也失败，尝试华为云源..."
+            npm config set registry "https://mirrors.huaweicloud.com/repository/npm/"
+            if npm install -g "${CODEX_PACKAGE}" --verbose; then
+                log_success "Codex CLI 安装成功（华为云源）"
+            else
+                log_fail "Codex CLI 安装失败，请检查网络或手动安装"
+                return 1
+            fi
+        fi
+    fi
+
+    if command -v codex &> /dev/null; then
+        log_info "Codex CLI 版本: $(codex --version 2>/dev/null || echo 'unknown')"
+    else
+        log_warn "⚠️ codex 命令未在 PATH 中找到，尝试全路径验证..."
+        if [ -f "${node_bin_dir}/codex" ]; then
+            log_info "Codex CLI 版本: $(${node_bin_dir}/codex --version 2>/dev/null || echo 'unknown')"
+        else
+            log_warn "codex 可执行文件未找到，请检查安装"
+        fi
+    fi
+
+    # ===== Step 4/4: 配置 ~/.codex/config.toml + .env =====
+    echo -e "\n${GREEN}── [4/4] 配置 Codex CLI 配置文件 ──${NC}"
+
+    local CODEX_DIR="${HOME}/.codex"
+    mkdir -p "${CODEX_DIR}"
+
+    local default_codex_base_url="${CODEX_BASE_URL:-$DEFAULT_CODEX_BASE_URL}"
+    local user_base_url=""
+    while true; do
+        read -e -p "请输入 Codex 中转 URL（直接回车使用默认值 ${default_codex_base_url}）：" user_base_url
+        user_base_url=$(echo "${user_base_url}" | xargs || true)
+        user_base_url="${user_base_url:-${default_codex_base_url}}"
+        if [[ "${user_base_url}" =~ ^https?://[^[:space:]\"]+$ ]]; then
+            break
+        fi
+        log_error "中转 URL 无效，请输入以 http:// 或 https:// 开头的 URL"
+        user_base_url=""
+    done
+
+    codex_check_relay_url "${user_base_url}" || true
+
+    cat > "${CODEX_DIR}/config.toml" << TOML_EOF
+model_provider = "OpenAI"
+model = "gpt-5.6-sol"
+review_model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
+network_access = "enabled"
+windows_wsl_setup_acknowledged = true
+approval_policy = "never"
+sandbox_mode="danger-full-access"
+plan_mode_reasoning_effort = "xhigh"
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "${user_base_url}"
+wire_api = "responses"
+requires_openai_auth = true
+
+[features]
+goals = true
+TOML_EOF
+    log_info "config.toml 已写入 ${CODEX_DIR}/config.toml"
+
+    echo
+    echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
+    echo -e "${RED}!!! 警告：Codex CLI 已启用 YOLO 模式 !!!${NC}"
+    echo -e "${RED}!!! approval_policy = \"never\"${NC}"
+    echo -e "${RED}!!! sandbox_mode = \"danger-full-access\"${NC}"
+    echo -e "${YELLOW}该模式会跳过审批，并允许 Codex 访问所有文件。${NC}"
+    echo -e "${YELLOW}关闭方法：编辑 ${CODEX_DIR}/config.toml，将两项改为：${NC}"
+    echo -e "  approval_policy = \"on-request\""
+    echo -e "  sandbox_mode = \"workspace-write\""
+    echo -e "${YELLOW}保存后重新启动 codex。${NC}"
+    echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
+
+    local OPENAI_API_KEY_PLACEHOLDER="YOUR_OPENAI_API_KEY_HERE"
+    local user_api_key=""
+    if [ -n "$OPENAI_API_KEY" ]; then
+        log_info "检测到 OPENAI_API_KEY 环境变量已设置，将直接使用"
+        user_api_key="${OPENAI_API_KEY}"
+    else
+        read -e -p "请输入你的 OpenAI API Key（直接回车使用占位符，稍后手动修改）：" user_api_key
+        user_api_key=$(echo "${user_api_key}" | xargs || true)
+    fi
+    user_api_key="${user_api_key:-${OPENAI_API_KEY_PLACEHOLDER}}"
+
+    cat > "${CODEX_DIR}/auth.json" << ENV_EOF
+{
+  "OPENAI_API_KEY": "${user_api_key}"
+}
+ENV_EOF
+    log_info "auth.json 已写入 ${CODEX_DIR}/auth.json"
+
+    if [ "${user_api_key}" = "${OPENAI_API_KEY_PLACEHOLDER}" ]; then
+        log_warn "请修改 ${CODEX_DIR}/auth.json 中的 OPENAI_API_KEY 为你实际的 API Key"
+        echo -e "${YELLOW}当前配置（API Key 使用占位符）:${NC}"
+        cat "${CODEX_DIR}/auth.json"
+    fi
+
+    # ===== 汇总 =====
+    echo
+    log_success "Codex CLI 安装完成"
+    log_info "Node.js: $(node -v) | npm: $(npm -v) | Codex CLI: $(codex --version 2>/dev/null || echo 'unavailable')"
+    log_info "配置文件: ${CODEX_DIR}/config.toml | ${CODEX_DIR}/auth.json"
+    log_info "新开的 Bash 终端会自动读取 ~/.bashrc"
+    log_info "若希望当前终端立即加载，请手动执行: source ~/.bashrc"
+    echo ""
+    log_info "使用方法："
+    echo -e "  ${GREEN}codex${NC}              - 启动 Codex CLI"
+    echo -e "  ${GREEN}codex --help${NC}       - 查看帮助"
+}
+
 # ==================== 终端桌宠 (clawd-term / CodeNoNo) ====================
 
 # 安装终端桌宠：tmux + Pillow + 脚本 + CodeNoNo 精灵图 + 注册 Claude Code hooks
@@ -1150,9 +1847,12 @@ ask_pet_install() {
 
 # TUI 多选菜单（上下键导航，空格/x 多选，回车确认）
 show_tui_menu() {
-    local n=11
+    local n=12
     local cursor=0
     local i key mark
+    local node_platform
+
+    node_platform="$(detect_node_platform 2>/dev/null)" || node_platform="未支持"
 
     # 选项列表
     local opt1="安装vllm"
@@ -1163,12 +1863,13 @@ show_tui_menu() {
     local opt6="停止所有运行容器"
     local opt7="看看谁在用卡"
     local opt8="安装 Claude Code"
-    local opt9="安装终端桌宠（需先装 Claude Code）"
-    local opt10="清除代理"
-    local opt11="退出"
+    local opt9="安装 Codex CLI"
+    local opt10="安装终端桌宠（需先装 Claude Code）"
+    local opt11="清除代理"
+    local opt12="退出"
 
     # 选中状态（全局数组，0=未选 1=已选）
-    _TUI_CHK=(0 0 0 0 0 0 0 0 0 0)
+    _TUI_CHK=(0 0 0 0 0 0 0 0 0 0 0)
 
     tput civis 2>/dev/null  # 隐藏光标
 
@@ -1182,7 +1883,8 @@ show_tui_menu() {
         printf "  ${GREEN}%-15s${NC} %s\n" "[代理]" "$DEFAULT_PROXY_IP:$DEFAULT_PROXY_PORT"
         printf "  ${GREEN}%-15s${NC} 分支 %s | 仓库 %s | 目录 %s\n" "[vllm]" "$DEFAULT_VLLM_BRANCH" "$DEFAULT_VLLM_REPO" "$DEFAULT_VLLM_INSTALL_DIR"
         printf "  ${GREEN}%-15s${NC} 分支 %s | 仓库 %s | 目录 %s\n" "[vllm-ascend]" "$DEFAULT_VLLM_ASCEND_BRANCH" "$DEFAULT_VLLM_ASCEND_REPO" "$DEFAULT_VLLM_ASCEND_INSTALL_DIR"
-        printf "  ${GREEN}%-15s${NC} Node %s | npm %s | 目录 %s\n" "[Claude Code]" "$DEFAULT_NODE_VERSION ($DEFAULT_NODE_ARCH)" "$DEFAULT_NPM_REGISTRY" "$DEFAULT_CLAUDE_CODE_INSTALL_DIR"
+        printf "  ${GREEN}%-15s${NC} Node %s | npm %s | 目录 %s\n" "[Claude Code]" "$DEFAULT_NODE_VERSION ($node_platform)" "$DEFAULT_NPM_REGISTRY" "$DEFAULT_CLAUDE_CODE_INSTALL_DIR"
+        printf "  ${GREEN}%-15s${NC} Node %s | npm %s | 包 %s\n" "[Codex CLI]" "$DEFAULT_NODE_VERSION ($node_platform)" "$DEFAULT_NPM_REGISTRY" "$CODEX_PACKAGE"
         printf "  ${GREEN}%-15s${NC} 容器 %s | 镜像 %s ${YELLOW}(创建新容器时的默认配置)${NC}\n" "[Docker]" "$DEFAULT_CONTAINER_NAME" "$DEFAULT_IMAGE_ID"
         echo "----------------------------------"
         for ((i=0; i<n; i++)); do
@@ -1190,7 +1892,7 @@ show_tui_menu() {
                 0) desc="$opt1" ;; 1) desc="$opt2" ;; 2) desc="$opt3" ;;
                 3) desc="$opt4" ;; 4) desc="$opt5" ;; 5) desc="$opt6" ;;
                 6) desc="$opt7" ;; 7) desc="$opt8" ;; 8) desc="$opt9" ;;
-                9) desc="$opt10" ;; 10) desc="$opt11" ;;
+                9) desc="$opt10" ;; 10) desc="$opt11" ;; 11) desc="$opt12" ;;
             esac
             if [ "${_TUI_CHK[$i]}" = "1" ]; then
                 mark="✓"
@@ -1302,12 +2004,15 @@ main() {
                     install_claude_code "$DEFAULT_CLAUDE_CODE_INSTALL_DIR"
                     ;;
                 9)
-                    install_clawd_pet
+                    install_codex_cli "$DEFAULT_CODEX_INSTALL_DIR"
                     ;;
                 10)
-                    clear_proxy
+                    install_clawd_pet
                     ;;
                 11)
+                    clear_proxy
+                    ;;
+                12)
                     log_info "退出脚本"
                     exit 0
                     ;;
@@ -1348,6 +2053,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 install_claude_code "${2:-$DEFAULT_CLAUDE_CODE_INSTALL_DIR}"
                 exit 0
                 ;;
+            --install-codex-cli)
+                install_codex_cli "${2:-$DEFAULT_CODEX_INSTALL_DIR}"
+                exit 0
+                ;;
             --install-clawd-pet)
                 install_clawd_pet
                 exit 0
@@ -1372,6 +2081,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 echo "  --install-vllm-ascend [DIR] [REPO] [BRANCH]  安装vllm-ascend（默认: 当前目录, $DEFAULT_VLLM_ASCEND_REPO, $DEFAULT_VLLM_ASCEND_BRANCH）"
                 echo "  --install-vllm-all [DIR]               一键安装vllm+vllm-ascend（默认: 当前目录）"
                 echo "  --install-claude-code [DIR]            安装Claude Code（末尾可选配置终端桌宠，内置 CodeNoNo/Bubu/Yi Er）"
+                echo "  --install-codex-cli [DIR]              安装 Codex CLI（@openai/codex）"
                 echo "  --install-clawd-pet                   单独安装终端桌宠（CodeNoNo/Bubu/Yi Er）"
                 echo "  --help                                 显示此帮助信息"
                 exit 0

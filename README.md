@@ -3,7 +3,7 @@
 本仓库包含两个**同级组件**，一个是开发调试 Skill，一个是一键安装脚本：
 
 - **Skill（开发调试）**：vLLM + vLLM-Ascend 通用开发与调试 Skill，覆盖推理精度诊断、服务管理、自动化测试与代码修复，支持**单机**和**PD分离**两种部署模式。 → 见下方「Skill」章节
-- **HyperScript（一键安装）**：交互式 TUI 脚本，负责 vllm / vllm-ascend / Claude Code 安装，以及 Docker 容器与 NPU/进程管理。 → 见下方「HyperScript 一键安装脚本」章节
+- **HyperScript（一键安装）**：交互式 TUI 脚本，负责 vllm / vllm-ascend / Claude Code / Codex CLI 安装，以及 Docker 容器与 NPU/进程管理。 → 见下方「HyperScript 一键安装脚本」章节
 
 ## 目录结构
 
@@ -11,7 +11,7 @@
 vllm-ascend-developer/                 # 仓库根
 ├── README.md                          # 本文件
 ├── HyperScript/                       # 【一键安装脚本】与 Skill 同级
-│   ├── HyperScript.sh                 # 安装 vllm/vllm-ascend/Claude Code、容器/NPU/进程管理
+│   ├── HyperScript.sh                 # 安装 vllm/vllm-ascend/Claude Code/Codex CLI、容器/NPU/进程管理
 │   ├── statusline.py                  # Claude Code 状态栏脚本（随 Claude Code 安装自动部署）
 │   └── clawd-term/                    # 终端桌宠（CodeNoNo/Bubu/Yi Er）：脚本 + 精灵图 + NOTICE
 └── vllm-ascend-developer/             # 【Skill】开发调试 Skill（Claude Code 加载入口）
@@ -177,14 +177,15 @@ pip3 install -r ./benchmark/requirements/extra.txt -i https://pypi.tuna.tsinghua
 | **停止所有运行容器** | 列出运行中容器，确认后批量 `docker stop`/`kill`（5s 超时保护，避免卡顿）。 |
 | **看看谁在用卡** | 解析 `npu-smi info` 进程区提取 PID，再用 `pwdx` 查每个进程工作目录，定位 NPU 占用者。 |
 | **安装 Claude Code** | 安装 Claude Code CLI，并自动部署状态栏与 `IS_SANDBOX` 等环境变量（详见下文）。 |
+| **安装 Codex CLI** | 安装 `@openai/codex`，配置中转 URL、API Key 及 `~/.codex/` 配置文件（详见下文）。 |
 | **安装终端桌宠** | 单独安装终端桌宠（CodeNoNo/Bubu/Yi Er 三选一），跑在 tmux 窗格里随 Claude Code 状态动；**需先装 Claude Code**。 |
 | **清除代理** | 清理 `http(s)_proxy`/`no_proxy`/`GIT_SSL_NO_VERIFY` 环境变量，以及 `~/.bashrc`、`~/.pip/pip.conf`、`~/.gitconfig` 中的代理配置。 |
 
 ### 安装 Claude Code（含状态栏）
 
-选择「安装 Claude Code」会自动完成 5 步：
+选择「安装 Claude Code」会自动完成 6 步：
 
-1. **Node.js**：华为云镜像下载解压（默认 `v24.14.0` arm64），bin 目录写入 `PATH`
+1. **Node.js**：从华为云镜像下载并解压 `v24.14.0`；根据当前系统自动选择发布包，支持 Linux/macOS 的 `x64`、`arm64`，以及 Linux `armv7l`。不支持的平台会在下载前报错，bin 目录写入 `PATH`
 2. **Claude Code CLI**：npm 安装（淘宝源 `registry.npmmirror.com`，失败依次回退腾讯云 / 华为云）
 3. **状态栏**：把同级 [`statusline.py`](./HyperScript/statusline.py) 复制到 `~/.claude/`，并写入 `settings.json` 的 `statusLine`（自动检测 `python3` 绝对路径，跨机器可用）
 4. **`settings.json`**：写入 `~/.claude/settings.json`，默认内容如下（Haiku/Sonnet/Opus 三档全部映射到 `glm-5.2[1m]`，`ANTHROPIC_API_KEY` 仅留占位符 —— **需自行填入真实 Key**）：
@@ -221,6 +222,17 @@ glm-5.2 | [EFFORT] high | [CTX] [▍░░░░░░░░░] 4% | [COST] $0.
 
 依次显示：模型名 · 思考强度（effort）· 上下文进度条（绿 <50% / 黄 <80% / 红）· 累计花费 · 输出速度（tok/s）。
 
+### 安装 Codex CLI
+
+选择「安装 Codex CLI」会使用与 Claude Code 相同的 Node.js 平台检测和 npm 镜像回退逻辑，安装 `@openai/codex`，并完成以下配置：
+
+1. 下载与当前 Linux/macOS 和 CPU 架构匹配的 Node.js 发布包，解压至 `<安装目录>/codex_cli_env/`
+2. 使用 npm 安装 Codex CLI；默认 npm 源失败时会依次尝试腾讯云和华为云镜像
+3. 提示输入 Codex 中转 URL（默认 `https://api.openai.com/v1`），检测连通性；遇到 SSL/CA 问题时尝试获取并更新中转站证书
+4. 写入 `~/.codex/config.toml` 和 `~/.codex/auth.json`；API Key 可直接使用 `OPENAI_API_KEY` 环境变量，或在交互时输入
+
+> **安全提示**：生成的 `config.toml` 默认包含 `approval_policy = "never"` 和 `sandbox_mode = "danger-full-access"`。这会跳过审批并允许 Codex 访问所有文件。需要受限执行时，请将其改为 `approval_policy = "on-request"` 和 `sandbox_mode = "workspace-write"` 后重启 Codex。
+
 ### 可选：终端桌宠（CodeNoNo / Bubu / Yi Er）
 
 选择「配置终端桌宠」后，会在 `~/.claude/pet/` 装一套**终端版**桌宠（与 GUI 版 clawd-on-desk 不同——无需图形桌面，headless SSH 终端即可用）：一只桌宠（**CodeNoNo / Bubu / Yi Er 三选一**）跑在 tmux 小窗格里，随 Claude Code 状态（思考 / 跑工具 / 完成 / 报错…）切换动画。
@@ -245,6 +257,7 @@ Claude Code **经典模式**下，鼠标滚轮和 `PgUp/PgDn` 都翻不了对话
 
 ```bash
 bash HyperScript/HyperScript.sh --install-claude-code [DIR]        # 安装 Claude Code
+bash HyperScript/HyperScript.sh --install-codex-cli [DIR]          # 安装 Codex CLI（@openai/codex）
 bash HyperScript/HyperScript.sh --install-clawd-pet                # 单独安装终端桌宠（CodeNoNo/Bubu/Yi Er）
 bash HyperScript/HyperScript.sh --install-vllm-all [DIR]           # 一键安装 vllm + vllm-ascend
 bash HyperScript/HyperScript.sh --install-vllm [DIR] [REPO] [BRANCH]
