@@ -212,7 +212,9 @@ pip3 install -r ./benchmark/requirements/extra.txt -i https://pypi.tuna.tsinghua
    export NODE_TLS_REJECT_UNAUTHORIZED=0
    export IS_SANDBOX=1
    ```
-6. **可选·终端桌宠**：5 步装完后会弹出 TUI 询问「是否配置终端桌宠」；选配置即自动装好一个跑在 tmux 窗格里、随 Claude Code 状态动的桌面宠物（内置 CodeNoNo/Bubu/Yi Er 三选一，详见下方「可选：终端桌宠」）。
+6. **终端桌宠（默认安装）**：5 步装完后**默认自动安装**终端桌宠到 `~/.claude/pet/`（不再弹 TUI 询问）——一个跑在 tmux 窗格里、随 Claude Code 状态动的桌面宠物，内置 CodeNoNo/Bubu/Yi Er 三种形象（启动时选），详见下方「终端桌宠」。
+
+> **安装收尾的「下一步」提示**：最后会固定打印一屏下一步（确保留在屏幕上、不被桌宠输出刷掉）：① 编辑 `~/.claude/settings.json` 把 `ANTHROPIC_API_KEY` 填成真实 Key；② `source ~/.bashrc` 让环境变量生效；③ 运行 `claude`；④ `bash ~/.claude/pet/start.sh` 启动桌宠。
 
 装完后的状态栏效果（随会话刷新自动更新）：
 
@@ -233,9 +235,9 @@ glm-5.2 | [EFFORT] high | [CTX] [▍░░░░░░░░░] 4% | [COST] $0.
 
 > **安全提示**：生成的 `config.toml` 默认包含 `approval_policy = "never"` 和 `sandbox_mode = "danger-full-access"`。这会跳过审批并允许 Codex 访问所有文件。需要受限执行时，请将其改为 `approval_policy = "on-request"` 和 `sandbox_mode = "workspace-write"` 后重启 Codex。
 
-### 可选：终端桌宠（CodeNoNo / Bubu / Yi Er）
+### 终端桌宠（CodeNoNo / Bubu / Yi Er）
 
-选择「配置终端桌宠」后，会在 `~/.claude/pet/` 装一套**终端版**桌宠（与 GUI 版 clawd-on-desk 不同——无需图形桌面，headless SSH 终端即可用）：一只桌宠（**CodeNoNo / Bubu / Yi Er 三选一**）跑在 tmux 小窗格里，随 Claude Code 状态（思考 / 跑工具 / 完成 / 报错…）切换动画。
+终端桌宠在**安装 Claude Code 时默认自动安装**到 `~/.claude/pet/`（也可用菜单「安装终端桌宠」或 `--install-clawd-pet` 单独安装/重装）。它是一套**终端版**桌宠（与 GUI 版 clawd-on-desk 不同——无需图形桌面，headless SSH 终端即可用）：一只桌宠（**CodeNoNo / Bubu / Yi Er 三选一**）跑在 tmux 小窗格里，随 Claude Code 状态（思考 / 跑工具 / 完成 / 报错…）切换动画。
 
 - **形象**：直接渲染 [`awesome-codex-pet`](https://github.com/rullerzhou-afk/awesome-codex-pet) 的精灵图为终端字符画（ANSI 真彩色 + ▀ 半块），内置 3 个——**CodeNoNo / Bubu / Yi Er**，仓库自带 `HyperScript/clawd-term/{codenono,bubu,yier}.webp`，离线可用。
 - **换形象**：默认 `start.sh`（不传参）就弹菜单选（CodeNoNo / Bubu / Yi Er + 布局）；或 `PET_PET=bubu bash ~/.claude/pet/start.sh col` 直接指定（默认 `codenono`）。

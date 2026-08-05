@@ -1082,17 +1082,44 @@ EOF
     echo -e "${YELLOW}当前配置（API Key 已用占位符代替）:${NC}"
     cat ~/.claude/settings.json
 
-    # ===== 汇总 =====
+    # ===== 写 ~/.claude.json：标记 onboarding 完成 + 开启第三方模型/fast mode =====
+    # 本安装为中转配置（第三方模型 glm-5.2[1m]，不走 Anthropic OAuth），故合并写入两个字段：
+    #   hasCompletedOnboarding=true —— 跳过首次启动的登录/新手引导
+    #   penguinModeOrgEnabled=true  —— 开启第三方模型支持与 fast mode（沿用上游补丁脚本的同名字段）
+    # 注意：~/.claude.json 与 ~/.claude/settings.json 是两个文件，且可能已有历史内容，需合并写入。
+    # 用 node：此时 Node.js 已在本流程前面装好并在 PATH 上，且是 Claude Code 生态编辑该配置的惯用方式。
+    if node <<'NODE'
+const fs = require('fs'), path = require('path'), os = require('os');
+const f = path.join(os.homedir(), '.claude.json');
+let data = {};
+try {
+    data = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf-8')) : {};
+} catch (e) {
+    if (fs.existsSync(f)) { try { fs.renameSync(f, f + '.bak-preinstall'); } catch (_) {} }  // 旧文件损坏：备份再重建
+    data = {};
+}
+fs.writeFileSync(f, JSON.stringify({ ...data, penguinModeOrgEnabled: true, hasCompletedOnboarding: true }, null, 2), 'utf-8');
+NODE
+    then
+        log_info "已写入 ~/.claude.json: hasCompletedOnboarding=true（跳过首次登录引导）、penguinModeOrgEnabled=true（第三方模型 + fast mode）"
+    else
+        log_warn "写入 ~/.claude.json 失败（不影响安装，首次启动 claude 可能需手动完成引导）"
+    fi
+
+    # ===== 配置终端桌宠（默认安装；汇总与「下一步」放到最后打印，确保留在屏幕上）=====
+    install_clawd_pet
+
+    # ===== 汇总 & 下一步（最后打印，确保留在屏幕上）=====
     echo
     log_success "Claude Code 安装完成"
     log_info "Node.js: $(node -v) | npm: $(npm -v) | Claude Code: $(claude -v 2>/dev/null || echo 'unavailable')"
-
-    # ===== 可选：配置终端桌宠 (CodeNoNo) =====
-    if ask_pet_install; then
-        install_clawd_pet
-    else
-        log_info "已跳过终端桌宠配置（之后可手动重跑本步或 bash ~/.claude/pet/start.sh）"
-    fi
+    echo
+    echo -e "${YELLOW}═══ 下一步（请按顺序操作）═══${NC}"
+    echo -e "  1. ${RED}编辑 ~/.claude/settings.json${NC}，把 ANTHROPIC_API_KEY 由占位符 YOUR_API_KEY_HERE 改成你的真实 Key（否则无法使用）"
+    echo -e "  2. 让环境变量生效：${GREEN}source ~/.bashrc${NC}（或新开一个终端）"
+    echo -e "  3. 启动：${GREEN}claude${NC}"
+    echo -e "  桌宠启动：${GREEN}bash ~/.claude/pet/start.sh${NC}（弹菜单选形象+布局；进入 tmux 主窗格运行 claude）"
+    echo -e "${YELLOW}═══════════════════════════${NC}"
 }
 
 # ==================== Codex CLI 安装函数 ====================
@@ -1810,37 +1837,6 @@ install_clawd_pet() {
     echo -e "  清晰度/尺寸：编辑 ${YELLOW}~/.claude/pet/pet.py${NC} 顶部 ${YELLOW}PET_W${NC}（默认 40）。"
     echo -e "  内置 3 个形象（CodeNoNo/Bubu/Yi Er）：${GREEN}bash ~/.claude/pet/start.sh${NC} 弹菜单选；或 ${GREEN}PET_PET=bubu${NC}（/yier/codenono）直接指定。"
     echo -e "  翻看 claude 历史：经典模式滚轮/PgUp 翻不了——用 ${GREEN}/tui fullscreen${NC} 后 ${GREEN}PgUp/PgDn${NC}，或按 ${GREEN}Ctrl+O${NC} 进 transcript 审阅。"
-}
-
-# TUI 二选一：是否配置终端桌宠。返回 0=配置，1=跳过（↑↓ 选择，Enter 确认）
-ask_pet_install() {
-    local cursor=0 key
-    local items=("配置终端桌宠 (CodeNoNo) —— tmux 窗格里随 Claude Code 状态动的桌面宠物" "跳过（之后可手动配置）")
-    tput civis 2>/dev/null
-    while true; do
-        clear
-        echo -e "${GREEN}========================================${NC}"
-        echo -e "${GREEN}  可选：是否配置终端桌宠？${NC}"
-        echo -e "${GREEN}========================================${NC}"
-        for i in 0 1; do
-            if [ "$i" -eq "$cursor" ]; then
-                echo -e "\e[7m> ${items[$i]}\e[0m"
-            else
-                echo -e "  ${items[$i]}"
-            fi
-        done
-        echo -e "${YELLOW}  ↑↓ 选择，Enter 确认${NC}"
-        IFS= read -rsn1 key
-        if [[ "$key" == $'\x1b' ]]; then
-            IFS= read -rsn2 -t 0.1 key
-            [[ "$key" == "[A" ]] && cursor=$(( (cursor - 1 + 2) % 2 ))
-            [[ "$key" == "[B" ]] && cursor=$(( (cursor + 1) % 2 ))
-            continue
-        fi
-        [[ "$key" == "" ]] && break
-    done
-    tput cnorm 2>/dev/null
-    [ "$cursor" -eq 0 ]
 }
 
 # ==================== 菜单与主入口 ====================
