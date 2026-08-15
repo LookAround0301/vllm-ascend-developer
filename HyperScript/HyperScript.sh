@@ -487,10 +487,11 @@ clear_proxy() {
 
     local BASHRC_FILE="$HOME/.bashrc"
     sed -i '/# 自动配置的代理（由安装脚本添加）/,+5d' "$BASHRC_FILE" 2>/dev/null || true
+    sed -i '/# 自动配置的代理（由安装脚本添加）/,+5d' "/etc/profile.d/proxy.sh" 2>/dev/null || true
     rm -f "$HOME/.pip/pip.conf" 2>/dev/null || true
     rm -f "/root/.gitconfig" 2>/dev/null || true
 
-    log_info "✅ 代理配置已清除（环境变量、~/.bashrc、pip、git）"
+    log_info "✅ 代理配置已清除（环境变量、~/.bashrc、/etc/profile.d、pip、git）"
     log_info "💡 若要立即让清理生效，执行: source ~/.bashrc"
 }
 
@@ -527,6 +528,21 @@ setup_proxy_silent() {
     echo "export https_proxy=\"http://p_atlas:proxy%40123@${input_ip}:${input_port}\"" >> "$BASHRC_FILE"
     echo "export no_proxy=\"127.0.0.1,.huawei.com,localhost,local,.local\"" >> "$BASHRC_FILE"
     echo "export GIT_SSL_NO_VERIFY=1" >> "$BASHRC_FILE"
+
+    # 同步代理到 /etc/profile.d/proxy.sh：登录 shell（bash -l，如 VS Code Server、ssh 登录执行）
+    # 只读 /etc/profile 不读 ~/.bashrc，不同步则这些环境下缺代理变量。幂等：先删旧块再追加。
+    local PROFILED_FILE="/etc/profile.d/proxy.sh"
+    if touch "${PROFILED_FILE}" 2>/dev/null; then
+        sed -i '/# 自动配置的代理（由安装脚本添加）/,+5d' "${PROFILED_FILE}" 2>/dev/null || true
+        echo -e "\n# 自动配置的代理（由安装脚本添加）" >> "${PROFILED_FILE}"
+        echo "export http_proxy=\"http://p_atlas:proxy%40123@${input_ip}:${input_port}\"" >> "${PROFILED_FILE}"
+        echo "export https_proxy=\"http://p_atlas:proxy%40123@${input_ip}:${input_port}\"" >> "${PROFILED_FILE}"
+        echo "export no_proxy=\"127.0.0.1,.huawei.com,localhost,local,.local\"" >> "${PROFILED_FILE}"
+        echo "export GIT_SSL_NO_VERIFY=1" >> "${PROFILED_FILE}"
+        chmod 644 "${PROFILED_FILE}" 2>/dev/null || true
+    else
+        log_warn "无 /etc/profile.d 写权限，代理仅写入 ~/.bashrc（登录 shell 环境可能缺代理）"
+    fi
 
     # 写入 pip 配置
     mkdir -p "$HOME/.pip"
@@ -895,6 +911,66 @@ check_npu_occupancy() {
 # ==================== Claude Code 安装函数 ====================
 
 # 安装 Claude Code CLI（Node.js + npm，含多源回退）
+# ==================== VS Code 扩展配置函数 ====================
+
+# 配置 VS Code Claude Code 扩展（写入 Machine 作用域设置，幂等合并）。
+# 背景：VS Code 面板的 claude 子进程只继承扩展宿主环境（不含 ~/.bashrc 的代理等变量，
+# 且宿主会把 http_proxy/https_proxy 以空字符串形式传入、优先级高于 settings.json env）；
+# 扩展还会从 claudeCode.environmentVariables 注入网关配置 —— 若用户本地 VS Code User 设置
+# 里存有旧网关（如 Kimi），会整体覆盖 ~/.claude/settings.json 的配置导致 401。
+# Machine 作用域优先级高于 User 作用域，写这里可一并解决，新容器首次连上 VS Code 即可直接对话。
+configure_claude_vscode_extension() {
+    local machine_settings_dir="$HOME/.vscode-server/data/Machine"
+
+    mkdir -p "${machine_settings_dir}"
+
+    # 网关/密钥以 ~/.claude/settings.json 的 env 为单一来源；代理取当前 shell（安装流程前面已配好）
+    if CLAUDE_PROXY_HTTP="${http_proxy:-}" CLAUDE_PROXY_HTTPS="${https_proxy:-}" CLAUDE_PROXY_NO="${no_proxy:-}" node <<'NODE'
+const fs = require('fs'), path = require('path'), os = require('os');
+const claudeEnvFile = path.join(os.homedir(), '.claude', 'settings.json');
+const machineFile = path.join(os.homedir(), '.vscode-server', 'data', 'Machine', 'settings.json');
+
+let src = {};
+try { src = JSON.parse(fs.readFileSync(claudeEnvFile, 'utf-8')).env || {}; } catch (e) {}
+
+const list = [
+    { name: 'ANTHROPIC_BASE_URL', value: src.ANTHROPIC_BASE_URL || 'https://open.bigmodel.cn/api/anthropic' },
+    { name: 'ANTHROPIC_API_KEY', value: src.ANTHROPIC_API_KEY || 'YOUR_API_KEY_HERE' },
+    { name: 'ANTHROPIC_DEFAULT_HAIKU_MODEL', value: src.ANTHROPIC_DEFAULT_HAIKU_MODEL || 'glm-5.3[1m]' },
+    { name: 'ANTHROPIC_DEFAULT_SONNET_MODEL', value: src.ANTHROPIC_DEFAULT_SONNET_MODEL || 'glm-5.3[1m]' },
+    { name: 'ANTHROPIC_DEFAULT_OPUS_MODEL', value: src.ANTHROPIC_DEFAULT_OPUS_MODEL || 'glm-5.3[1m]' },
+];
+// 企业网：直连不通，必须走代理；且代理做 TLS 中间人，需关掉证书校验
+if (process.env.CLAUDE_PROXY_HTTPS) {
+    list.push({ name: 'http_proxy', value: process.env.CLAUDE_PROXY_HTTP || process.env.CLAUDE_PROXY_HTTPS });
+    list.push({ name: 'https_proxy', value: process.env.CLAUDE_PROXY_HTTPS });
+    list.push({ name: 'no_proxy', value: process.env.CLAUDE_PROXY_NO || '127.0.0.1,.huawei.com,localhost,local,.local' });
+}
+list.push({ name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' });
+list.push({ name: 'GIT_SSL_NO_VERIFY', value: '1' });
+
+let data = {};
+try {
+    data = fs.existsSync(machineFile) ? JSON.parse(fs.readFileSync(machineFile, 'utf-8')) : {};
+} catch (e) {
+    try { fs.renameSync(machineFile, machineFile + '.bak-preinstall'); } catch (_) {}  // 旧文件损坏：备份再重建
+    data = {};
+}
+data['claudeCode.disableLoginPrompt'] = true;   // 第三方网关配置，不走 Anthropic OAuth 登录
+data['claudeCode.environmentVariables'] = list; // 整体覆盖用户本地（可能过期的）注入配置
+fs.writeFileSync(machineFile, JSON.stringify(data, null, 4) + '\n', 'utf-8');
+NODE
+    then
+        log_info "已写入 VS Code Machine 设置: ${machine_settings_dir}/settings.json"
+        log_info "注入 claudeCode.environmentVariables（网关/密钥/代理/TLS）+ claudeCode.disableLoginPrompt"
+        if [ -z "${https_proxy:-}" ]; then
+            log_warn "当前 shell 未设置代理，本次未注入代理 —— 企业网内 VS Code 面板可能无法联网"
+        fi
+    else
+        log_warn "写入 VS Code Machine 设置失败（不影响终端使用；VS Code 面板可能需要手动配置）"
+    fi
+}
+
 install_claude_code() {
     local install_dir="${1:-$DEFAULT_CLAUDE_CODE_INSTALL_DIR}"
 
@@ -940,7 +1016,7 @@ install_claude_code() {
     fi
 
     # ===== Step 1/4: 下载 Node.js =====
-    echo -e "\n${GREEN}── [1/5] 下载 Node.js ──${NC}"
+    echo -e "\n${GREEN}── [1/6] 下载 Node.js ──${NC}"
 
     if [ -f "${node_archive_path}" ]; then
         log_info "Node.js 压缩包已存在：${node_archive_path}"
@@ -957,7 +1033,7 @@ install_claude_code() {
     fi
 
     # ===== Step 2/4: 解压 Node.js + 配置环境变量 =====
-    echo -e "\n${GREEN}── [2/5] 解压 Node.js 并配置环境变量 ──${NC}"
+    echo -e "\n${GREEN}── [2/6] 解压 Node.js 并配置环境变量 ──${NC}"
 
     if [ -d "${node_extract_dir}" ]; then
         log_info "Node.js 已解压，跳过"
@@ -980,6 +1056,34 @@ install_claude_code() {
     echo "export IS_SANDBOX=1" >> ~/.bashrc
     echo "export CLAUDE_CODE_EFFORT_LEVEL=max" >> ~/.bashrc
 
+    # 同步 Claude Code 环境变量到 /etc/profile.d/proxy.sh（登录 shell 生效；幂等：先删旧块再追加）
+    local PROFILED_FILE="/etc/profile.d/proxy.sh"
+    if touch "${PROFILED_FILE}" 2>/dev/null; then
+        sed -i '/# Claude Code 环境变量（由安装脚本添加）/,+4d' "${PROFILED_FILE}" 2>/dev/null || true
+        echo -e "\n# Claude Code 环境变量（由安装脚本添加）" >> "${PROFILED_FILE}"
+        echo "export PATH=${node_bin_dir}:\$PATH" >> "${PROFILED_FILE}"
+        echo "export NODE_TLS_REJECT_UNAUTHORIZED=0" >> "${PROFILED_FILE}"
+        echo "export IS_SANDBOX=1" >> "${PROFILED_FILE}"
+        echo "export CLAUDE_CODE_EFFORT_LEVEL=max" >> "${PROFILED_FILE}"
+        chmod 644 "${PROFILED_FILE}" 2>/dev/null || true
+        log_info "已同步 Claude Code 环境变量到 ${PROFILED_FILE}（登录 shell 生效）"
+
+        # 代理块补偿同步：代理是此前就配好的（本次未走 setup_proxy_silent）时，
+        # /etc/profile.d/proxy.sh 里不会有代理块 —— 用当前 shell 的代理值补写一次
+        if [ -n "${https_proxy:-}" ] && ! grep -q '自动配置的代理（由安装脚本添加）' "${PROFILED_FILE}" 2>/dev/null; then
+            sed -i '/http_proxy=/d;/https_proxy=/d;/no_proxy=/d;/GIT_SSL_NO_VERIFY=/d' "${PROFILED_FILE}" 2>/dev/null || true
+            echo -e "\n# 自动配置的代理（由安装脚本添加）" >> "${PROFILED_FILE}"
+            echo "export http_proxy=\"${http_proxy}\"" >> "${PROFILED_FILE}"
+            echo "export https_proxy=\"${https_proxy}\"" >> "${PROFILED_FILE}"
+            echo "export no_proxy=\"${no_proxy}\"" >> "${PROFILED_FILE}"
+            echo "export GIT_SSL_NO_VERIFY=1" >> "${PROFILED_FILE}"
+            chmod 644 "${PROFILED_FILE}" 2>/dev/null || true
+            log_info "已补偿同步代理到 ${PROFILED_FILE}（此前 profile.d 缺代理块）"
+        fi
+    else
+        log_warn "无 /etc/profile.d 写权限，Claude Code 环境变量仅写入 ~/.bashrc"
+    fi
+
     export PATH=${node_bin_dir}:$PATH
     export NODE_TLS_REJECT_UNAUTHORIZED=0
     export IS_SANDBOX=1
@@ -995,7 +1099,7 @@ install_claude_code() {
     fi
 
     # ===== Step 3/4: 安装 Claude Code =====
-    echo -e "\n${GREEN}── [3/5] 安装 Claude Code ──${NC}"
+    echo -e "\n${GREEN}── [3/6] 安装 Claude Code ──${NC}"
 
     log_info "配置 npm 镜像源..."
     npm config set strict-ssl false
@@ -1036,7 +1140,7 @@ install_claude_code() {
     fi
 
     # ===== Step 4/5: 配置状态栏脚本 statusline.py =====
-    echo -e "\n${GREEN}── [4/5] 配置状态栏脚本 statusline.py ──${NC}"
+    echo -e "\n${GREEN}── [4/6] 配置状态栏脚本 statusline.py ──${NC}"
 
     mkdir -p ~/.claude
     local STATUSLINE_SRC="${SCRIPT_DIR}/statusline.py"
@@ -1049,7 +1153,7 @@ install_claude_code() {
     fi
 
     # ===== Step 5/5: 配置 settings.json =====
-    echo -e "\n${GREEN}── [5/5] 配置 Claude Code settings.json ──${NC}"
+    echo -e "\n${GREEN}── [5/6] 配置 Claude Code settings.json ──${NC}"
 
     # 检测 python3 绝对路径, 写入 statusLine command, 保证跨机器可用
     local CLAUDE_PYTHON
@@ -1057,6 +1161,29 @@ install_claude_code() {
     if [ -z "${CLAUDE_PYTHON}" ]; then
         log_warn "未找到 python3，状态栏将回退使用 python3（请确保运行时 PATH 可用）"
         CLAUDE_PYTHON="python3"
+    fi
+
+    # API Key：默认沿用 ~/.claude/settings.json 已有的 Key（重装/升级场景），首次安装为占位符
+    local CLAUDE_API_KEY="YOUR_API_KEY_HERE"
+    if [ -f "$HOME/.claude/settings.json" ]; then
+        local existing_key
+        existing_key=$(grep -o '"ANTHROPIC_API_KEY"[^,}]*' "$HOME/.claude/settings.json" 2>/dev/null | head -1 | sed 's/.*:[[:space:]]*"\(.*\)"/\1/')
+        [ -n "${existing_key}" ] && CLAUDE_API_KEY="${existing_key}"
+    fi
+    local input_api_key
+    read -e -p "输入 ANTHROPIC_API_KEY（回车=保留原值/占位符）：" input_api_key
+    input_api_key=$(echo "${input_api_key}" | xargs)
+    [ -n "${input_api_key}" ] && CLAUDE_API_KEY="${input_api_key}"
+
+    # 代理写入 settings.json env：非 bash 启动的 claude 进程（如 VS Code 面板子进程）也能出网
+    local PROXY_ENV_LINES=""
+    if [ -n "${https_proxy:-}" ]; then
+        PROXY_ENV_LINES="    \"http_proxy\": \"${http_proxy}\",
+    \"https_proxy\": \"${https_proxy}\",
+    \"no_proxy\": \"${no_proxy}\",
+"
+    else
+        log_warn "当前 shell 未设置 https_proxy，settings.json 将不注入代理（企业网内 VS Code 面板可能无法联网）"
     fi
 
     cat > ~/.claude/settings.json << EOF
@@ -1067,9 +1194,13 @@ install_claude_code() {
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.3[1m]",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.3[1m]",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.3[1m]",
-    "ANTHROPIC_API_KEY": "YOUR_API_KEY_HERE",
+    "ANTHROPIC_API_KEY": "${CLAUDE_API_KEY}",
     "API_TIMEOUT_MS": "3000000",
-    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+${PROXY_ENV_LINES}    "NODE_TLS_REJECT_UNAUTHORIZED": "0",
+    "GIT_SSL_NO_VERIFY": "1",
+    "IS_SANDBOX": "1",
+    "CLAUDE_CODE_EFFORT_LEVEL": "max"
   },
   "outputStyle": "engineer-professional",
   "skipDangerousModePermissionPrompt": true,
@@ -1080,9 +1211,11 @@ install_claude_code() {
 }
 EOF
     log_info "settings.json 已写入 ~/.claude/settings.json"
-    log_warn "请修改 ~/.claude/settings.json 中的 ANTHROPIC_API_KEY 为你实际的 API Key"
-    echo -e "${YELLOW}当前配置（API Key 已用占位符代替）:${NC}"
-    cat ~/.claude/settings.json
+    if [ "${CLAUDE_API_KEY}" = "YOUR_API_KEY_HERE" ]; then
+        log_warn "请修改 ~/.claude/settings.json 中的 ANTHROPIC_API_KEY 为你实际的 API Key"
+    fi
+    echo -e "${YELLOW}当前配置（API Key 已隐藏）:${NC}"
+    sed 's/"ANTHROPIC_API_KEY": "[^"]*"/"ANTHROPIC_API_KEY": "<已隐藏>"/' ~/.claude/settings.json
 
     # ===== 写 ~/.claude.json：标记 onboarding 完成 + 开启第三方模型/fast mode =====
     # 本安装为中转配置（第三方模型 glm-5.3[1m]，不走 Anthropic OAuth），故合并写入两个字段：
@@ -1108,6 +1241,11 @@ NODE
         log_warn "写入 ~/.claude.json 失败（不影响安装，首次启动 claude 可能需手动完成引导）"
     fi
 
+    # ===== Step 6/6: 配置 VS Code 扩展（面板开箱即用）=====
+    echo -e "\n${GREEN}── [6/6] 配置 VS Code 扩展（Machine 设置注入） ──${NC}"
+
+    configure_claude_vscode_extension
+
     # ===== 配置终端桌宠（默认安装；汇总与「下一步」放到最后打印，确保留在屏幕上）=====
     install_clawd_pet
 
@@ -1117,9 +1255,12 @@ NODE
     log_info "Node.js: $(node -v) | npm: $(npm -v) | Claude Code: $(claude -v 2>/dev/null || echo 'unavailable')"
     echo
     echo -e "${YELLOW}═══ 下一步（请按顺序操作）═══${NC}"
-    echo -e "  1. ${RED}编辑 ~/.claude/settings.json${NC}，把 ANTHROPIC_API_KEY 由占位符 YOUR_API_KEY_HERE 改成你的真实 Key（否则无法使用）"
+    echo -e "  1. ${RED}编辑 ~/.claude/settings.json${NC}，把 ANTHROPIC_API_KEY 由占位符 YOUR_API_KEY_HERE 改成你的真实 Key（安装时已输入则跳过）"
+    echo -e "     ⚠️ 若之后更换 Key，需同步修改 ~/.vscode-server/data/Machine/settings.json（或重跑本安装脚本）"
     echo -e "  2. 让环境变量生效：${GREEN}source ~/.bashrc${NC}（或新开一个终端）"
     echo -e "  3. 启动：${GREEN}claude${NC}"
+    echo -e "  4. VS Code 面板：安装 Claude Code 扩展后 Reload Window、新建对话即可直接使用（网关/代理配置已由脚本注入）"
+    echo -e "     ⚠️ 笔记本本地 VS Code User 设置里若有旧的 claudeCode.environmentVariables（如 Kimi），已被本容器 Machine 设置覆盖，可放心保留"
     echo -e "  桌宠启动：${GREEN}bash ~/.claude/pet/start.sh${NC}（弹菜单选形象+布局；进入 tmux 主窗格运行 claude）"
     echo -e "${YELLOW}═══════════════════════════${NC}"
 }
