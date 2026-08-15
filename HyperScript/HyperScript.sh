@@ -971,6 +971,76 @@ NODE
     fi
 }
 
+# ==================== Claude Code 卸载函数 ====================
+
+# 卸载 Claude Code：删除安装脚本新增的文件与配置。代理配置不在此处理（由 clear_proxy 负责）。
+uninstall_claude_code() {
+    echo -e "\n${GREEN}── 卸载 Claude Code ──${NC}"
+
+    # 从 ~/.bashrc 的环境块反查 claude_code_env 实际路径（兼容任意安装目录），随后删除环境块
+    local claude_bin_dir node_env_dir
+    claude_bin_dir=$(sed -n 's/^export PATH=\([^:]*claude_code_env[^:]*\):\$PATH$/\1/p' "$HOME/.bashrc" 2>/dev/null | head -1)
+    node_env_dir=$(dirname "$(dirname "${claude_bin_dir:-/nonexistent/bin}")")
+    [ -d "${node_env_dir}" ] || node_env_dir="${DEFAULT_CLAUDE_CODE_INSTALL_DIR}/claude_code_env"
+
+    sed -i '/# Claude Code 环境变量（由安装脚本添加）/,+4d' "$HOME/.bashrc" 2>/dev/null || true
+    sed -i '/# Claude Code 环境变量（由安装脚本添加）/,+4d' "/etc/profile.d/proxy.sh" 2>/dev/null || true
+    log_info "已移除 ~/.bashrc 与 /etc/profile.d/proxy.sh 中的 Claude Code 环境变量块"
+
+    # VS Code Machine 设置：只删 claudeCode.* 两个键，保留其他配置
+    if [ -f "$HOME/.vscode-server/data/Machine/settings.json" ]; then
+        local node_bin="node"
+        [ -n "${claude_bin_dir}" ] && [ -x "${claude_bin_dir}/node" ] && node_bin="${claude_bin_dir}/node"
+        if "${node_bin}" <<'NODE'
+const fs = require('fs'), path = require('path'), os = require('os');
+const f = path.join(os.homedir(), '.vscode-server', 'data', 'Machine', 'settings.json');
+try {
+    const d = JSON.parse(fs.readFileSync(f, 'utf-8'));
+    delete d['claudeCode.disableLoginPrompt'];
+    delete d['claudeCode.environmentVariables'];
+    fs.writeFileSync(f, JSON.stringify(d, null, 4) + '\n');
+} catch (e) { process.exit(1); }
+NODE
+        then
+            log_info "已移除 VS Code Machine 设置中的 claudeCode.* 配置"
+        else
+            log_warn "移除 VS Code Machine 设置失败（可手动编辑 ~/.vscode-server/data/Machine/settings.json）"
+        fi
+    fi
+
+    # claude_code_env 目录（Node.js + Claude Code 本体，可随时重装）
+    if [ -d "${node_env_dir}" ]; then
+        local confirm_env
+        read -e -p "删除 ${node_env_dir}（Node.js + Claude Code 本体）？(y/n，默认y)：" confirm_env
+        confirm_env=$(echo "${confirm_env}" | xargs || echo "y")
+        confirm_env=${confirm_env:-y}
+        if [ "${confirm_env}" = "y" ]; then
+            command -v npm &>/dev/null && { npm config delete registry 2>/dev/null || true; npm config delete strict-ssl 2>/dev/null || true; }
+            rm -rf "${node_env_dir}"
+            log_info "已删除 ${node_env_dir}"
+        else
+            log_info "保留 ${node_env_dir}"
+        fi
+    fi
+
+    # ~/.claude 与 ~/.claude.json（含会话历史/记忆/skills/桌宠，默认保留）
+    if [ -d "$HOME/.claude" ] || [ -f "$HOME/.claude.json" ]; then
+        echo -e "${RED}⚠️ 删除后将丢失全部会话历史、记忆(memory)、skills 与桌宠配置${NC}"
+        local confirm_data
+        read -e -p "同时删除 ~/.claude 与 ~/.claude.json？(y/n，默认n)：" confirm_data
+        confirm_data=$(echo "${confirm_data}" | xargs || echo "n")
+        confirm_data=${confirm_data:-n}
+        if [ "${confirm_data}" = "y" ]; then
+            rm -rf "$HOME/.claude" "$HOME/.claude.json"
+            log_info "已删除 ~/.claude 与 ~/.claude.json"
+        else
+            log_info "已保留 ~/.claude 与 ~/.claude.json"
+        fi
+    fi
+
+    log_info "卸载完成。执行 source ~/.bashrc（或新开终端）使 PATH 变更生效"
+}
+
 install_claude_code() {
     local install_dir="${1:-$DEFAULT_CLAUDE_CODE_INSTALL_DIR}"
 
@@ -1223,7 +1293,7 @@ EOF
     #   penguinModeOrgEnabled=true  —— 开启第三方模型支持与 fast mode（沿用上游补丁脚本的同名字段）
     # 注意：~/.claude.json 与 ~/.claude/settings.json 是两个文件，且可能已有历史内容，需合并写入。
     # 用 node：此时 Node.js 已在本流程前面装好并在 PATH 上，且是 Claude Code 生态编辑该配置的惯用方式。
-    if node <<'NODE'
+    if CLAUDE_API_KEY_ENV="${CLAUDE_API_KEY}" node <<'NODE'
 const fs = require('fs'), path = require('path'), os = require('os');
 const f = path.join(os.homedir(), '.claude.json');
 let data = {};
@@ -1233,10 +1303,20 @@ try {
     if (fs.existsSync(f)) { try { fs.renameSync(f, f + '.bak-preinstall'); } catch (_) {} }  // 旧文件损坏：备份再重建
     data = {};
 }
+// 预批准自定义 API Key：CLI 对"检测到自定义 Key 是否使用"的确认状态存于
+// customApiKeyResponses.approved（指纹算法 = key.trim().slice(-20)，见 CLI 源码 Fhe()）。
+// 不预批准时 VS Code 扩展会因"无有效凭据"提示登录，终端首次运行也要手动确认一次。
+const key = (process.env.CLAUDE_API_KEY_ENV || '').trim();
+if (key && key !== 'YOUR_API_KEY_HERE') {
+    const fp = key.slice(-20);
+    const approved = data.customApiKeyResponses?.approved ?? [];
+    if (!approved.includes(fp)) approved.push(fp);
+    data.customApiKeyResponses = { approved, rejected: data.customApiKeyResponses?.rejected ?? [] };
+}
 fs.writeFileSync(f, JSON.stringify({ ...data, penguinModeOrgEnabled: true, hasCompletedOnboarding: true }, null, 2), 'utf-8');
 NODE
     then
-        log_info "已写入 ~/.claude.json: hasCompletedOnboarding=true（跳过首次登录引导）、penguinModeOrgEnabled=true（第三方模型 + fast mode）"
+        log_info "已写入 ~/.claude.json: hasCompletedOnboarding=true（跳过引导）、penguinModeOrgEnabled=true（第三方模型+fast mode）、customApiKeyResponses 已预批准（跳过 Key 确认/VS Code 不再提示登录）"
     else
         log_warn "写入 ~/.claude.json 失败（不影响安装，首次启动 claude 可能需手动完成引导）"
     fi
@@ -1985,7 +2065,7 @@ install_clawd_pet() {
 
 # TUI 多选菜单（上下键导航，空格/x 多选，回车确认）
 show_tui_menu() {
-    local n=12
+    local n=13
     local cursor=0
     local i key mark
     local node_platform
@@ -2004,10 +2084,11 @@ show_tui_menu() {
     local opt9="安装 Codex CLI"
     local opt10="安装终端桌宠（需先装 Claude Code）"
     local opt11="清除代理"
-    local opt12="退出"
+    local opt12="卸载 Claude Code"
+    local opt13="退出"
 
     # 选中状态（全局数组，0=未选 1=已选）
-    _TUI_CHK=(0 0 0 0 0 0 0 0 0 0 0)
+    _TUI_CHK=(0 0 0 0 0 0 0 0 0 0 0 0)
 
     tput civis 2>/dev/null  # 隐藏光标
 
@@ -2030,7 +2111,7 @@ show_tui_menu() {
                 0) desc="$opt1" ;; 1) desc="$opt2" ;; 2) desc="$opt3" ;;
                 3) desc="$opt4" ;; 4) desc="$opt5" ;; 5) desc="$opt6" ;;
                 6) desc="$opt7" ;; 7) desc="$opt8" ;; 8) desc="$opt9" ;;
-                9) desc="$opt10" ;; 10) desc="$opt11" ;; 11) desc="$opt12" ;;
+                9) desc="$opt10" ;; 10) desc="$opt11" ;; 11) desc="$opt12" ;; 12) desc="$opt13" ;;
             esac
             if [ "${_TUI_CHK[$i]}" = "1" ]; then
                 mark="✓"
@@ -2075,9 +2156,9 @@ show_tui_menu() {
             break
         fi
 
-        # a：全选（不含退出）
+        # a：全选（不含退出与卸载）
         if [[ "$key" == "a" ]]; then
-            for ((i=0; i<n-1; i++)); do _TUI_CHK[$i]=1; done
+            for ((i=0; i<n-1; i++)); do [ $i -eq 11 ] && continue; _TUI_CHK[$i]=1; done
             continue
         fi
 
@@ -2151,6 +2232,9 @@ main() {
                     clear_proxy
                     ;;
                 12)
+                    uninstall_claude_code
+                    ;;
+                13)
                     log_info "退出脚本"
                     exit 0
                     ;;
