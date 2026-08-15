@@ -973,15 +973,17 @@ install_claude_code() {
     fi
 
     # 配置环境变量（持久化 + 当前会话）
-    sed -i '/# Claude Code 环境变量（由安装脚本添加）/,+3d' ~/.bashrc 2>/dev/null || true
+    sed -i '/# Claude Code 环境变量（由安装脚本添加）/,+4d' ~/.bashrc 2>/dev/null || true
     echo -e "\n# Claude Code 环境变量（由安装脚本添加）" >> ~/.bashrc
     echo "export PATH=${node_bin_dir}:\$PATH" >> ~/.bashrc
     echo "export NODE_TLS_REJECT_UNAUTHORIZED=0" >> ~/.bashrc
     echo "export IS_SANDBOX=1" >> ~/.bashrc
+    echo "export CLAUDE_CODE_EFFORT_LEVEL=max" >> ~/.bashrc
 
     export PATH=${node_bin_dir}:$PATH
     export NODE_TLS_REJECT_UNAUTHORIZED=0
     export IS_SANDBOX=1
+    export CLAUDE_CODE_EFFORT_LEVEL=max
 
     if node -v > /dev/null 2>&1; then
         log_success "Node.js $(node -v) / npm $(npm -v)"
@@ -1062,9 +1064,9 @@ install_claude_code() {
   "env": {
     "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.2[1m]",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2[1m]",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.2[1m]",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.3[1m]",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.3[1m]",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.3[1m]",
     "ANTHROPIC_API_KEY": "YOUR_API_KEY_HERE",
     "API_TIMEOUT_MS": "3000000",
     "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
@@ -1083,7 +1085,7 @@ EOF
     cat ~/.claude/settings.json
 
     # ===== 写 ~/.claude.json：标记 onboarding 完成 + 开启第三方模型/fast mode =====
-    # 本安装为中转配置（第三方模型 glm-5.2[1m]，不走 Anthropic OAuth），故合并写入两个字段：
+    # 本安装为中转配置（第三方模型 glm-5.3[1m]，不走 Anthropic OAuth），故合并写入两个字段：
     #   hasCompletedOnboarding=true —— 跳过首次启动的登录/新手引导
     #   penguinModeOrgEnabled=true  —— 开启第三方模型支持与 fast mode（沿用上游补丁脚本的同名字段）
     # 注意：~/.claude.json 与 ~/.claude/settings.json 是两个文件，且可能已有历史内容，需合并写入。

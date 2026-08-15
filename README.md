@@ -188,15 +188,15 @@ pip3 install -r ./benchmark/requirements/extra.txt -i https://pypi.tuna.tsinghua
 1. **Node.js**：从华为云镜像下载并解压 `v24.14.0`；根据当前系统自动选择发布包，支持 Linux/macOS 的 `x64`、`arm64`，以及 Linux `armv7l`。不支持的平台会在下载前报错，bin 目录写入 `PATH`
 2. **Claude Code CLI**：npm 安装（淘宝源 `registry.npmmirror.com`，失败依次回退腾讯云 / 华为云）
 3. **状态栏**：把同级 [`statusline.py`](./HyperScript/statusline.py) 复制到 `~/.claude/`，并写入 `settings.json` 的 `statusLine`（自动检测 `python3` 绝对路径，跨机器可用）
-4. **`settings.json`**：写入 `~/.claude/settings.json`，默认内容如下（Haiku/Sonnet/Opus 三档全部映射到 `glm-5.2[1m]`，`ANTHROPIC_API_KEY` 仅留占位符 —— **需自行填入真实 Key**）：
+4. **`settings.json`**：写入 `~/.claude/settings.json`，默认内容如下（Haiku/Sonnet/Opus 三档全部映射到 `glm-5.3[1m]`，`ANTHROPIC_API_KEY` 仅留占位符 —— **需自行填入真实 Key**）：
    ```json
    {
      "env": {
        "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
-       "ANTHROPIC_DEFAULT_HAIKU_MODEL":  "glm-5.2[1m]",
-       "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2[1m]",
-       "ANTHROPIC_DEFAULT_OPUS_MODEL":   "glm-5.2[1m]",
+       "ANTHROPIC_DEFAULT_HAIKU_MODEL":  "glm-5.3[1m]",
+       "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.3[1m]",
+       "ANTHROPIC_DEFAULT_OPUS_MODEL":   "glm-5.3[1m]",
        "ANTHROPIC_API_KEY": "YOUR_API_KEY_HERE",
        "API_TIMEOUT_MS": "3000000",
        "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
@@ -206,11 +206,12 @@ pip3 install -r ./benchmark/requirements/extra.txt -i https://pypi.tuna.tsinghua
      "statusLine": { "type": "command", "command": "<python3 绝对路径> ~/.claude/statusline.py" }
    }
    ```
-5. **环境变量**：`~/.bashrc` 追加以下 3 行（幂等——写入前先用 `sed` 删除旧的同名块，重复安装不会累积重复行）：
+5. **环境变量**：`~/.bashrc` 追加以下 4 行（幂等——写入前先用 `sed` 删除旧的同名块，重复安装不会累积重复行）：
    ```bash
    export PATH=<node_bin_dir>:$PATH
    export NODE_TLS_REJECT_UNAUTHORIZED=0
    export IS_SANDBOX=1
+   export CLAUDE_CODE_EFFORT_LEVEL=max
    ```
 6. **终端桌宠（默认安装）**：5 步装完后**默认自动安装**终端桌宠到 `~/.claude/pet/`（不再弹 TUI 询问）——一个跑在 tmux 窗格里、随 Claude Code 状态动的桌面宠物，内置 CodeNoNo/Bubu/Yi Er 三种形象（启动时选），详见下方「终端桌宠」。
 
@@ -219,7 +220,7 @@ pip3 install -r ./benchmark/requirements/extra.txt -i https://pypi.tuna.tsinghua
 装完后的状态栏效果（随会话刷新自动更新）：
 
 ```
-glm-5.2 | [EFFORT] high | [CTX] [▍░░░░░░░░░] 4% | [COST] $0.93 | [SPEED] 63 tok/s
+glm-5.3 | [EFFORT] high | [CTX] [▍░░░░░░░░░] 4% | [COST] $0.93 | [SPEED] 63 tok/s
 ```
 
 依次显示：模型名 · 思考强度（effort）· 上下文进度条（绿 <50% / 黄 <80% / 红）· 累计花费 · 输出速度（tok/s）。

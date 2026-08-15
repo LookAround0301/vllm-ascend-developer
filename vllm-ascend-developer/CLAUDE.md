@@ -8,7 +8,8 @@ This is a **Claude Code Skill** (`vllm-ascend-developer`) for developing and deb
 
 - Skill entry point: `SKILL.md` (has YAML frontmatter `name: vllm-ascend-developer`).
 - All relative paths in `SKILL.md` and `modules/` assume the current working directory is **this skill folder** (e.g. `config/service.yaml`, `python scripts/ssh_utils.py`).
-- See the repo-root `README.md` for the install/operations overview (mostly duplicates `SKILL.md`).
+- The repo root (one level up) has its own `CLAUDE.md` covering both components and shared invariants; see also the repo-root `README.md` for the install/operations overview (mostly duplicates `SKILL.md`).
+- `modules/flashcomm-mtp-debug.md` is a special-topic guide (FlashComm + MTP debugging) invoked directly when the user asks about those features — it is not part of the precision-diagnosis loop below.
 
 ## Architecture (the part that spans multiple files)
 
@@ -19,8 +20,8 @@ SKILL.md (entry) → workflows/precision-diagnosis.md (the canonical loop)
                         │
    ┌────────┬───────────┼───────────┬───────────────┬─────────────┐
    ▼        ▼           ▼           ▼               ▼             ▼
-service  test-runner  verifier  aisbench-evaluator  log-analyzer  auto-fixer
- (lifecycle) (curl)   (compare)  (dataset eval)     (classify)    (patch vllm-ascend)
+service  test-runner  verifier  aisbench-evaluator  log-analyzer  auto-fixer   [flashcomm-mtp-debug]
+ (lifecycle) (curl)   (compare)  (dataset eval)     (classify)    (patch vllm-ascend)  (special topic, off-loop)
    │        │                       │                  │             │
    └────────┴───────────┬───────────┘                  └──────┬──────┘
                         ▼                                     ▼
