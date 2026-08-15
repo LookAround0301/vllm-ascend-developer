@@ -1254,15 +1254,14 @@ NODE
     log_success "Claude Code 安装完成"
     log_info "Node.js: $(node -v) | npm: $(npm -v) | Claude Code: $(claude -v 2>/dev/null || echo 'unavailable')"
     echo
-    echo -e "${YELLOW}═══ 下一步（请按顺序操作）═══${NC}"
-    echo -e "  1. ${RED}编辑 ~/.claude/settings.json${NC}，把 ANTHROPIC_API_KEY 由占位符 YOUR_API_KEY_HERE 改成你的真实 Key（安装时已输入则跳过）"
-    echo -e "     ⚠️ 若之后更换 Key，需同步修改 ~/.vscode-server/data/Machine/settings.json（或重跑本安装脚本）"
-    echo -e "  2. 让环境变量生效：${GREEN}source ~/.bashrc${NC}（或新开一个终端）"
-    echo -e "  3. 启动：${GREEN}claude${NC}"
-    echo -e "  4. VS Code 面板：安装 Claude Code 扩展后 Reload Window、新建对话即可直接使用（网关/代理配置已由脚本注入）"
-    echo -e "     ⚠️ 笔记本本地 VS Code User 设置里若有旧的 claudeCode.environmentVariables（如 Kimi），已被本容器 Machine 设置覆盖，可放心保留"
-    echo -e "  桌宠启动：${GREEN}bash ~/.claude/pet/start.sh${NC}（弹菜单选形象+布局；进入 tmux 主窗格运行 claude）"
-    echo -e "${YELLOW}═══════════════════════════${NC}"
+    echo -e "${YELLOW}═══ 下一步 ═══${NC}"
+    echo -e "  1. 让环境变量生效：${GREEN}source ~/.bashrc${NC}（或新开一个终端）"
+    echo -e "  2. 启动：${GREEN}claude${NC} ｜ VS Code 装扩展后 Reload Window、新建对话即可用面板"
+    echo -e "  3. 改配置时（${RED}API Key 还是占位符 YOUR_API_KEY_HERE 时必改${NC}），编辑以下两处并保持一致："
+    echo -e "     · ${GREEN}~/.claude/settings.json${NC} —— 终端 claude（API Key / 代理）"
+    echo -e "     · ${GREEN}~/.vscode-server/data/Machine/settings.json${NC} —— VS Code 面板（改后需 Reload Window）"
+    echo -e "  桌宠：${GREEN}bash ~/.claude/pet/start.sh${NC}"
+    echo -e "${YELLOW}═══════════${NC}"
 }
 
 # ==================== Codex CLI 安装函数 ====================
