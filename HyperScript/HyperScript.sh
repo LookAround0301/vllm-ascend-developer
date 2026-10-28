@@ -2,7 +2,8 @@
 
 # HyperScript 一键安装脚本
 # 交互式 TUI 菜单（上下键 + 空格多选 + 回车确认）
-# 支持功能：安装 vllm / vllm-ascend、创建容器、NPU 查询、万能杀、安装 Claude Code 等
+# 支持功能：安装 vllm / vllm-ascend、CANNBot 依赖（Python / CANN 检查 / PyTorch+torch_npu / tilelang-ascend）、
+#           创建容器、NPU 查询、万能杀、安装 Claude Code / Codex CLI / opencode 等
 
 # set -euo pipefail
 
@@ -49,6 +50,14 @@ DEFAULT_CLAUDE_CODE_INSTALL_DIR="$(pwd)"
 DEFAULT_CODEX_INSTALL_DIR="$(pwd)"
 CODEX_PACKAGE="@openai/codex"
 DEFAULT_CODEX_BASE_URL="https://api.openai.com/v1"
+
+# ==================== CANNBot 开发依赖配置（来自 install.sh） ====================
+PIP_INDEX="${PIP_INDEX:-https://mirrors.huaweicloud.com/repository/pypi/simple}"
+# 注：vllm-ascend 官方镜像自带配套的 torch/torch_npu，一键安装检测到已装会直接跳过；
+# PIN 只对从零装的环境生效，版本要求以所装 vllm-ascend 的依赖声明为准。
+TORCH_VERSION_PIN="${TORCH_VERSION_PIN:-2.9.0}"          # PyTorch 版本（与 torch_npu 同号配套，换 vllm-ascend 时一起改）
+TORCH_NPU_VERSION_PIN="${TORCH_NPU_VERSION_PIN:-2.9.0}"  # torch_npu 版本
+TILELANG_INSTALL_DIR="${TILELANG_INSTALL_DIR:-$HOME/tilelang-ascend}"
 
 # ==================== 通用工具函数 ====================
 
@@ -905,6 +914,262 @@ check_npu_occupancy() {
     echo "----------------------------------"
     log_info "✅ NPU占用者查询完成！"
     echo "=================================="
+    return 0
+}
+
+# ==================== CANNBot 开发依赖（来自 install.sh：Python / CANN / PyTorch / torch_npu / tilelang） ====================
+
+# 检查/安装 Python (>= 3.8)：版本不足时按包管理器自动安装（apt 走 deadsnakes PPA）
+check_or_install_python() {
+    echo -e "${GREEN}── 检查/安装 Python (>= 3.8) ──${NC}"
+    local python_cmd="${PYTHON_CMD:-python3}"
+    local py_version major minor sudo_cmd=""
+    py_version=$("$python_cmd" --version 2>&1 | grep -oP '\d+\.\d+' || echo "0.0")
+    major=$(echo "$py_version" | cut -d. -f1)
+    minor=$(echo "$py_version" | cut -d. -f2)
+
+    if [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -lt 8 ]; }; then
+        log_warn "Python ${py_version} 不满足要求，需要 Python >= 3.8"
+        log_info "尝试通过系统包管理器安装 Python..."
+        if [ "$(id -u)" != "0" ] && command -v sudo &>/dev/null; then
+            sudo_cmd="sudo"
+        fi
+        if command -v apt-get &>/dev/null; then
+            ${sudo_cmd} apt-get update -qq
+            ${sudo_cmd} apt-get install -y -qq software-properties-common
+            ${sudo_cmd} add-apt-repository -y ppa:deadsnakes/ppa
+            ${sudo_cmd} apt-get update -qq
+            ${sudo_cmd} apt-get install -y -qq python3.10 python3.10-venv python3.10-dev
+            python_cmd="python3.10"
+        elif command -v yum &>/dev/null; then
+            ${sudo_cmd} yum install -y python38 python38-devel
+            python_cmd="python3.8"
+        elif command -v dnf &>/dev/null; then
+            ${sudo_cmd} dnf install -y python3.10 python3.10-devel
+            python_cmd="python3.10"
+        else
+            log_fail "未识别到包管理器（apt/yum/dnf），请手动安装 Python >= 3.8"
+            return 1
+        fi
+        log_success "Python 已安装：$("$python_cmd" --version 2>&1)"
+    else
+        log_success "Python $("$python_cmd" --version 2>&1) 已满足要求"
+    fi
+    return 0
+}
+
+# 从 CANN 目录提取版本号（compiler/version.info 或 opp/version.info，格式 Version=X.Y.Z）
+_detect_cann_version() {
+    local dir="$1" ver_file=""
+    if [ -f "$dir/compiler/version.info" ]; then
+        ver_file="$dir/compiler/version.info"
+    elif [ -f "$dir/opp/version.info" ]; then
+        ver_file="$dir/opp/version.info"
+    fi
+    if [ -n "$ver_file" ]; then
+        grep -oP 'Version=\K[0-9.]+' "$ver_file" 2>/dev/null || echo ""
+    fi
+}
+
+# 检查 Ascend CANN (>= 8.0)，仅检查不安装。找到且满足返回 0，否则返回 1
+check_cann() {
+    echo -e "${GREEN}── 检查 Ascend CANN (>= 8.0) ──${NC}"
+    local cann_found=false cann_version="" cann_path=""
+    local env_var candidate ver dir
+
+    # 优先级1：环境变量（ASCEND_OPP_PATH 指向 .../opp，上溯一级）
+    for env_var in ASCEND_TOOLKIT_HOME ASCEND_HOME_PATH ASCEND_HOME ASCEND_OPP_PATH; do
+        candidate="${!env_var}"
+        if [ -n "$candidate" ] && [ -d "$candidate" ]; then
+            if [[ "$candidate" == */opp ]]; then
+                candidate="$(dirname "$candidate")"
+            fi
+            ver=$(_detect_cann_version "$candidate")
+            if [ -n "$ver" ]; then
+                cann_version="$ver"; cann_path="$candidate"; cann_found=true; break
+            fi
+        fi
+    done
+
+    # 优先级2：/usr/local/Ascend/cann-X.Y.Z/ 布局
+    if ! $cann_found; then
+        for dir in /usr/local/Ascend/cann-*/; do
+            [ -d "$dir" ] || continue
+            ver=$(_detect_cann_version "$dir")
+            if [ -n "$ver" ]; then cann_version="$ver"; cann_path="$dir"; cann_found=true; break; fi
+        done
+    fi
+
+    # 优先级3：/usr/local/Ascend/ascend-toolkit/<version>/ 布局
+    if ! $cann_found && [ -d "/usr/local/Ascend/ascend-toolkit" ]; then
+        for dir in /usr/local/Ascend/ascend-toolkit/*/; do
+            [ -d "$dir" ] || continue
+            ver=$(_detect_cann_version "$dir")
+            if [ -n "$ver" ]; then cann_version="$ver"; cann_path="$dir"; cann_found=true; break; fi
+        done
+    fi
+
+    # 优先级4：/usr/local/Ascend/ 裸布局
+    if ! $cann_found && [ -d "/usr/local/Ascend" ]; then
+        ver=$(_detect_cann_version "/usr/local/Ascend")
+        if [ -n "$ver" ]; then cann_version="$ver"; cann_path="/usr/local/Ascend"; cann_found=true; fi
+    fi
+
+    if $cann_found; then
+        local cann_major
+        cann_major=$(echo "$cann_version" | cut -d. -f1)
+        if [ "$cann_major" -ge 8 ]; then
+            log_success "Ascend CANN ${cann_version}（${cann_path}）"
+            return 0
+        fi
+        log_warn "Ascend CANN ${cann_version}（${cann_path}）< 8.0，请升级"
+        return 1
+    fi
+    log_fail "未找到 Ascend CANN >= 8.0，请先手动安装：https://www.hiascend.com/software/cann"
+    return 1
+}
+
+# 安装 PyTorch + torch_npu：torch 与 torch_npu 同号配套（版本见顶部 PIN 变量）。
+# 原则：只补缺，不覆写——检查与安装统一走 python3 -m pip（同一环境）；
+# pip 里已有但 import 失败时只告警不动手，防止 pip 依赖解析把已装的高版本
+# torch/torch_npu 连带回退（如 torch==2.9.0 会连带把 torch-npu 2.10.x 降级）。
+install_pytorch_npu() {
+    local skip_confirm="${1:-}"
+    echo -e "${GREEN}── 安装 PyTorch ${TORCH_VERSION_PIN} + torch_npu ${TORCH_NPU_VERSION_PIN} ──${NC}"
+    command -v python3 &>/dev/null || { log_fail "python3 不存在"; return 1; }
+    python3 -m pip --version &>/dev/null || { log_fail "python3 -m pip 不可用，请先为 python3 安装 pip"; return 1; }
+    if [ -z "$skip_confirm" ]; then
+        confirm_to_continue || return 0
+    fi
+
+    # torch：import 结果 + pip 元数据双重判断
+    local torch_import torch_meta need_install_torch=false torch_reason
+    torch_import=$(python3 -c "import torch; print(torch.__version__)" 2>/dev/null || echo "")
+    torch_meta=$(python3 -m pip show torch 2>/dev/null | awk '/^Version:/{print $2}')
+
+    if [ -n "$torch_import" ]; then
+        local torch_major
+        torch_major=$(echo "$torch_import" | cut -d. -f1)
+        if [ "$torch_major" -ge 2 ]; then
+            log_success "PyTorch ${torch_import} 已安装，跳过"
+        else
+            need_install_torch=true
+            torch_reason="当前 PyTorch ${torch_import} < 2.0"
+        fi
+    elif [ -n "$torch_meta" ]; then
+        log_warn "pip 中已有 torch ${torch_meta}，但 import 失败——不自动改动（防止连带降级 torch_npu 等已装依赖）"
+        log_warn "  import 报错：$(python3 -c "import torch" 2>&1 | tail -n 1)"
+        log_warn "  请先排查 import 失败原因，确认后手动处理："
+        log_warn "  python3 -m pip install --force-reinstall torch==${TORCH_VERSION_PIN} -i $PIP_INDEX"
+    else
+        need_install_torch=true
+        torch_reason="未检测到 torch"
+    fi
+
+    if $need_install_torch; then
+        log_info "${torch_reason}，正在安装 PyTorch ${TORCH_VERSION_PIN}（与 torch_npu ${TORCH_NPU_VERSION_PIN} 同号配套）..."
+        if python3 -m pip install "torch==${TORCH_VERSION_PIN}" -q -i "$PIP_INDEX"; then
+            log_success "PyTorch $(python3 -c "import torch; print(torch.__version__)" 2>/dev/null || echo "${TORCH_VERSION_PIN}") 安装完成"
+        else
+            log_fail "PyTorch 安装失败，请手动安装：python3 -m pip install torch==${TORCH_VERSION_PIN} -i $PIP_INDEX"
+            return 1
+        fi
+    fi
+
+    # torch_npu：import 结果 + pip 元数据双重判断
+    local npu_import npu_meta
+    npu_import=$(python3 -c "import torch_npu; print(torch_npu.__version__)" 2>/dev/null || echo "")
+    npu_meta=$(python3 -m pip show torch-npu 2>/dev/null | awk '/^Version:/{print $2}')
+
+    if [ -n "$npu_import" ] && [ "$(printf '%s\n' "$npu_import" "$TORCH_NPU_VERSION_PIN" | sort -V | head -n1)" = "$TORCH_NPU_VERSION_PIN" ]; then
+        log_success "torch_npu ${npu_import} 已满足要求"
+    elif [ -n "$npu_import" ]; then
+        log_warn "torch_npu ${npu_import} < ${TORCH_NPU_VERSION_PIN}，保持现状不自动升级"
+        log_warn "  手动升级：python3 -m pip install --upgrade torch-npu==${TORCH_NPU_VERSION_PIN} -i $PIP_INDEX"
+    elif [ -n "$npu_meta" ]; then
+        log_warn "pip 中已有 torch-npu ${npu_meta}，但 import 失败——不自动改动"
+        log_warn "  import 报错：$(python3 -c "import torch_npu" 2>&1 | tail -n 1)"
+        log_warn "  常见原因：与 torch 版本不配套、CANN 环境未 source。确认后手动处理："
+        log_warn "  python3 -m pip install --force-reinstall torch-npu==${TORCH_NPU_VERSION_PIN} -i $PIP_INDEX"
+    else
+        log_info "torch_npu 未安装，正在安装 ${TORCH_NPU_VERSION_PIN}（走华为云镜像，可能较慢）..."
+        if python3 -m pip install "torch-npu==${TORCH_NPU_VERSION_PIN}" -i "$PIP_INDEX" --timeout 60 --retries 2; then
+            log_success "torch_npu ${TORCH_NPU_VERSION_PIN} 安装完成"
+        else
+            log_warn "torch_npu 安装失败（不中断后续步骤），请手动安装："
+            log_warn "  python3 -m pip install torch-npu==${TORCH_NPU_VERSION_PIN} -i $PIP_INDEX"
+        fi
+    fi
+    return 0
+}
+
+# 源码安装 tilelang-ascend（来自 install.sh）：clone + install_ascend.sh + set_env.sh；
+# 已安装（set_env.sh 存在且可 import tilelang）则跳过，FORCE_TILELANG_REINSTALL=1 强制重装
+install_tilelang_ascend() {
+    local skip_confirm="${1:-}"
+    echo -e "${GREEN}── 安装 tilelang-ascend（源码编译）──${NC}"
+    check_command git
+    local tilelang_dir="${TILELANG_INSTALL_DIR}"
+    if [ -z "$skip_confirm" ]; then
+        log_info "目录：${tilelang_dir}（可用环境变量 TILELANG_INSTALL_DIR 修改）"
+        confirm_to_continue || return 0
+    fi
+
+    local already=false
+    if [ "${FORCE_TILELANG_REINSTALL:-}" != "1" ] && [ -f "${tilelang_dir}/set_env.sh" ]; then
+        if bash -c "source '${tilelang_dir}/set_env.sh' && python3 -c 'import tilelang'" 2>/dev/null; then
+            log_success "tilelang-ascend 已安装（${tilelang_dir}），跳过"
+            log_info "强制重装：FORCE_TILELANG_REINSTALL=1"
+            already=true
+        fi
+    fi
+
+    if [ "$already" = false ]; then
+        if [ -d "${tilelang_dir}" ]; then
+            log_info "目录已存在，更新仓库..."
+            (cd "${tilelang_dir}" && git pull --recurse-submodules -q) || log_warn "git pull 失败，使用本地代码继续"
+        else
+            log_info "正在克隆 tilelang-ascend（含子模块，可能较慢）..."
+            git clone --recursive https://github.com/tile-ai/tilelang-ascend.git "${tilelang_dir}" || { log_fail "克隆失败"; return 1; }
+        fi
+
+        log_info "正在编译安装 tilelang-ascend（耗时较长）..."
+        (cd "${tilelang_dir}" && bash install_ascend.sh) || { log_fail "编译安装失败，请查看上方日志"; return 1; }
+        log_success "tilelang-ascend 安装完成"
+
+        if [ -f "${tilelang_dir}/set_env.sh" ]; then
+            # shellcheck disable=SC1091
+            source "${tilelang_dir}/set_env.sh"
+        fi
+    fi
+
+    local set_env_line="source ${tilelang_dir}/set_env.sh"
+    if grep -Fxq "${set_env_line}" "$HOME/.bashrc" 2>/dev/null; then
+        log_info "set_env.sh 已在 ~/.bashrc 中"
+    else
+        echo "" >> "$HOME/.bashrc"
+        echo "# tilelang-ascend 环境（由安装脚本添加）" >> "$HOME/.bashrc"
+        echo "${set_env_line}" >> "$HOME/.bashrc"
+        log_success "已追加到 ~/.bashrc：${set_env_line}"
+    fi
+    return 0
+}
+
+# 一键安装 CANNBot 开发依赖：Python → CANN 检查 → PyTorch/torch_npu → tilelang-ascend
+# （对应 install.sh 主流程；Node.js 与 AI CLI 工具用本脚本的 Claude Code / Codex CLI / opencode 菜单项）
+install_cannbot_deps() {
+    echo -e "${GREEN}━━━ 一键安装 CANNBot 开发依赖 ━━━${NC}"
+    log_info "流程：Python(>=3.8) → CANN(>=8.0) 检查 → PyTorch+torch_npu → tilelang-ascend"
+    confirm_to_continue || return 0
+
+    check_or_install_python || { log_fail "Python 步骤失败，终止"; return 1; }
+    check_cann || { log_fail "CANN 检查未通过，终止（CANN 需手动安装）"; return 1; }
+    install_pytorch_npu "skip_confirm" || { log_fail "PyTorch/torch_npu 步骤失败，终止"; return 1; }
+    install_tilelang_ascend "skip_confirm" || { log_fail "tilelang-ascend 步骤失败，终止"; return 1; }
+
+    echo
+    log_success "CANNBot 开发依赖一键安装完成！"
+    log_info "记得执行 source ~/.bashrc 使环境变量生效"
     return 0
 }
 
@@ -2065,7 +2330,7 @@ install_clawd_pet() {
 
 # TUI 多选菜单（上下键导航，空格/x 多选，回车确认）
 show_tui_menu() {
-    local n=13
+    local n=14
     local cursor=0
     local i key mark
     local node_platform
@@ -2076,19 +2341,21 @@ show_tui_menu() {
     local opt1="安装vllm"
     local opt2="安装vllm-ascend"
     local opt3="一键安装vllm+vllm-ascend"
-    local opt4="创建vllm容器"
-    local opt5="万能杀"
-    local opt6="停止所有运行容器"
-    local opt7="看看谁在用卡"
-    local opt8="安装 Claude Code"
-    local opt9="安装 Codex CLI"
-    local opt10="安装终端桌宠（需先装 Claude Code）"
-    local opt11="清除代理"
-    local opt12="卸载 Claude Code"
-    local opt13="退出"
+    local opt4="一键安装CANNBot依赖（Python/CANN/PyTorch/torch_npu/tilelang）"
+    local opt5="创建vllm容器"
+    local opt6="万能杀"
+    local opt7="停止所有运行容器"
+    local opt8="看看谁在用卡"
+    local opt9="安装 Claude Code"
+    local opt10="安装 Codex CLI"
+    local opt11="安装终端桌宠（需先装 Claude Code）"
+    local opt12="清除代理"
+    local opt13="卸载 Claude Code"
+    local opt14="退出"
 
     # 选中状态（全局数组，0=未选 1=已选）
-    _TUI_CHK=(0 0 0 0 0 0 0 0 0 0 0 0)
+    _TUI_CHK=()
+    for ((i=0; i<n; i++)); do _TUI_CHK[$i]=0; done
 
     tput civis 2>/dev/null  # 隐藏光标
 
@@ -2105,13 +2372,14 @@ show_tui_menu() {
         printf "  ${GREEN}%-15s${NC} Node %s | npm %s | 目录 %s\n" "[Claude Code]" "$DEFAULT_NODE_VERSION ($node_platform)" "$DEFAULT_NPM_REGISTRY" "$DEFAULT_CLAUDE_CODE_INSTALL_DIR"
         printf "  ${GREEN}%-15s${NC} Node %s | npm %s | 包 %s\n" "[Codex CLI]" "$DEFAULT_NODE_VERSION ($node_platform)" "$DEFAULT_NPM_REGISTRY" "$CODEX_PACKAGE"
         printf "  ${GREEN}%-15s${NC} 容器 %s | 镜像 %s ${YELLOW}(创建新容器时的默认配置)${NC}\n" "[Docker]" "$DEFAULT_CONTAINER_NAME" "$DEFAULT_IMAGE_ID"
+        printf "  ${GREEN}%-15s${NC} torch/torch_npu %s | PyPI %s | tilelang %s\n" "[CANNBot]" "$TORCH_VERSION_PIN" "$PIP_INDEX" "$TILELANG_INSTALL_DIR"
         echo "----------------------------------"
         for ((i=0; i<n; i++)); do
             case $i in
                 0) desc="$opt1" ;; 1) desc="$opt2" ;; 2) desc="$opt3" ;;
                 3) desc="$opt4" ;; 4) desc="$opt5" ;; 5) desc="$opt6" ;;
                 6) desc="$opt7" ;; 7) desc="$opt8" ;; 8) desc="$opt9" ;;
-                9) desc="$opt10" ;; 10) desc="$opt11" ;; 11) desc="$opt12" ;; 12) desc="$opt13" ;;
+                9) desc="$opt10" ;; 10) desc="$opt11" ;; 11) desc="$opt12" ;; 12) desc="$opt13" ;; 13) desc="$opt14" ;;
             esac
             if [ "${_TUI_CHK[$i]}" = "1" ]; then
                 mark="✓"
@@ -2158,7 +2426,7 @@ show_tui_menu() {
 
         # a：全选（不含退出与卸载）
         if [[ "$key" == "a" ]]; then
-            for ((i=0; i<n-1; i++)); do [ $i -eq 11 ] && continue; _TUI_CHK[$i]=1; done
+            for ((i=0; i<n-1; i++)); do [ $i -eq 12 ] && continue; _TUI_CHK[$i]=1; done
             continue
         fi
 
@@ -2208,33 +2476,36 @@ main() {
                     install_vllm_all "$DEFAULT_VLLM_INSTALL_DIR"
                     ;;
                 4)
-                    create_vllm_container
+                    install_cannbot_deps
                     ;;
                 5)
-                    kill_all_related_process
+                    create_vllm_container
                     ;;
                 6)
-                    stop_all_containers
+                    kill_all_related_process
                     ;;
                 7)
-                    check_npu_occupancy
+                    stop_all_containers
                     ;;
                 8)
-                    install_claude_code "$DEFAULT_CLAUDE_CODE_INSTALL_DIR"
+                    check_npu_occupancy
                     ;;
                 9)
-                    install_codex_cli "$DEFAULT_CODEX_INSTALL_DIR"
+                    install_claude_code "$DEFAULT_CLAUDE_CODE_INSTALL_DIR"
                     ;;
                 10)
-                    install_clawd_pet
+                    install_codex_cli "$DEFAULT_CODEX_INSTALL_DIR"
                     ;;
                 11)
-                    clear_proxy
+                    install_clawd_pet
                     ;;
                 12)
-                    uninstall_claude_code
+                    clear_proxy
                     ;;
                 13)
+                    uninstall_claude_code
+                    ;;
+                14)
                     log_info "退出脚本"
                     exit 0
                     ;;
@@ -2271,6 +2542,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 check_npu_occupancy
                 exit 0
                 ;;
+            --install-cannbot-deps)
+                install_cannbot_deps || exit 1
+                exit 0
+                ;;
             --install-claude-code)
                 install_claude_code "${2:-$DEFAULT_CLAUDE_CODE_INSTALL_DIR}"
                 exit 0
@@ -2299,6 +2574,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 echo "用法: $0 [选项]"
                 echo "选项:"
                 echo "  --check-npu                            查看NPU占用者"
+                echo "  --install-cannbot-deps                 一键安装CANNBot依赖（Python/CANN检查/PyTorch+torch_npu/tilelang）"
                 echo "  --install-vllm [DIR] [REPO] [BRANCH]   安装vllm（默认: 当前目录, $DEFAULT_VLLM_REPO, $DEFAULT_VLLM_BRANCH）"
                 echo "  --install-vllm-ascend [DIR] [REPO] [BRANCH]  安装vllm-ascend（默认: 当前目录, $DEFAULT_VLLM_ASCEND_REPO, $DEFAULT_VLLM_ASCEND_BRANCH）"
                 echo "  --install-vllm-all [DIR]               一键安装vllm+vllm-ascend（默认: 当前目录）"
