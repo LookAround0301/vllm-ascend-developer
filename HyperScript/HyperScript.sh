@@ -59,6 +59,12 @@ TORCH_VERSION_PIN="${TORCH_VERSION_PIN:-2.9.0}"          # PyTorch 版本（与 
 TORCH_NPU_VERSION_PIN="${TORCH_NPU_VERSION_PIN:-2.9.0}"  # torch_npu 版本
 TILELANG_INSTALL_DIR="${TILELANG_INSTALL_DIR:-$HOME/tilelang-ascend}"
 
+# ==================== CANNBot 智能体插件配置 ====================
+# CANNBot（https://gitcode.com/cann/cannbot）：优先 npm 安装（npx），失败回退源码 init.sh
+DEFAULT_CANNBOT_REPO="https://gitcode.com/cann/cannbot.git"
+DEFAULT_CANNBOT_PLUGIN="ops-direct-invoke"   # 默认官方插件
+DEFAULT_CANNBOT_TOOL="claude"                # 默认目标 CLI 工具：claude/opencode/codex/trae/dsh
+
 # ==================== 通用工具函数 ====================
 
 # 输出绿色 [INFO] 日志
@@ -1170,6 +1176,302 @@ install_cannbot_deps() {
     echo
     log_success "CANNBot 开发依赖一键安装完成！"
     log_info "记得执行 source ~/.bashrc 使环境变量生效"
+    return 0
+}
+
+# ==================== CANNBot 智能体插件安装函数 ====================
+
+# 确保 node/npm 可用：优先当前环境 → 复用 Claude Code 目录已解压的 Node.js → 现下载一份
+# （与 install_claude_code 相同的 claude_code_env 目录布局，后续装 Claude Code 可直接复用压缩包与解压目录）
+ensure_cannbot_node() {
+    if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+        log_success "Node.js $(node -v) / npm $(npm -v)"
+        return 0
+    fi
+
+    local reuse_bin
+    reuse_bin="$(ls -d "${DEFAULT_CLAUDE_CODE_INSTALL_DIR}"/claude_code_env/node-*/bin 2>/dev/null | head -n 1)"
+    if [ -n "${reuse_bin}" ] && [ -x "${reuse_bin}/node" ]; then
+        export PATH="${reuse_bin}:$PATH"
+        log_info "复用 Claude Code 目录下的 Node.js：${reuse_bin}"
+    else
+        local node_platform
+        if ! node_platform="$(detect_node_platform)"; then
+            return 1
+        fi
+        local env_dir="${DEFAULT_CLAUDE_CODE_INSTALL_DIR}/claude_code_env"
+        local filename="node-${DEFAULT_NODE_VERSION}-${node_platform}.tar.gz"
+        ensure_dir "${env_dir}"
+        log_info "下载 Node.js ${DEFAULT_NODE_VERSION} (${node_platform})..."
+        if ! wget --no-check-certificate -O "${env_dir}/${filename}" "${DEFAULT_NODE_MIRROR_BASE}/${DEFAULT_NODE_VERSION}/${filename}"; then
+            rm -f "${env_dir}/${filename}"
+            log_fail "Node.js 下载失败"
+            return 1
+        fi
+        if ! tar -xf "${env_dir}/${filename}" -C "${env_dir}"; then
+            log_fail "Node.js 解压失败"
+            return 1
+        fi
+        local node_bin_dir="${env_dir}/node-${DEFAULT_NODE_VERSION}-${node_platform}/bin"
+        export PATH="${node_bin_dir}:$PATH"
+        # 写入 ~/.bashrc（幂等：先删自己的旧块再追加）
+        sed -i '/# Node.js 环境变量（由安装脚本添加）/,+2d' ~/.bashrc 2>/dev/null || true
+        {
+            echo ""
+            echo "# Node.js 环境变量（由安装脚本添加）"
+            echo "export PATH=\"${node_bin_dir}:\$PATH\""
+            echo "export NODE_TLS_REJECT_UNAUTHORIZED=0"
+        } >> ~/.bashrc
+        log_info "Node.js PATH 已写入 ~/.bashrc"
+    fi
+
+    if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+        log_fail "Node.js/npm 不可用（PATH：$(command -v node 2>/dev/null || echo '未找到 node')）"
+        return 1
+    fi
+    log_success "Node.js $(node -v) / npm $(npm -v)"
+}
+
+# ==================== CANNBot 插件勾选界面 ====================
+
+# 插件清单（与 cannbot 仓 plugins-official/ + plugins-community/ 一致），填充全局数组
+# 注意：插件 ID 取 plugin.json 的 name（源码安装时按 CANNBOT_PLUGIN_DIRS 找 init.sh，cake 的目录名特殊）
+_cannbot_load_plugins() {
+    CANNBOT_OFFICIAL_COUNT=9
+    CANNBOT_PLUGIN_NAMES=(ops-direct-invoke ops-direct-invoke-flash ops-registry-invoke model-infer-optimize hccl-op-generator triton-op-generator catlass-op-generator ops-perf-optimize pypto-op-orchestrator)
+    CANNBOT_PLUGIN_DESCS=("Ascend C 直调算子开发" "Ascend C 核函数从零构建" "Ascend C 注册算子开发（ACLNN/GEIR）" "NPU 模型迁移/精度对齐/推理优化" "HCCL AICPU 标准通信算子开发" "Triton-Ascend 算子代码生成与优化" "CATLASS C++ 算子开发" "AscendC 算子端到端性能调优" "PyPTO 算子开发")
+    CANNBOT_PLUGIN_KINDS=(official official official official official official official official official)
+    CANNBOT_PLUGIN_DIRS=(ops-direct-invoke ops-direct-invoke-flash ops-registry-invoke model-infer-optimize hccl-op-generator triton-op-generator catlass-op-generator ops-perf-optimize pypto-op-orchestrator)
+
+    # 社区插件（实验孵化性质）
+    CANNBOT_PLUGIN_NAMES+=(cake ascendc-ops-perf-evolution ascendc-port-orchestrator model-train-precision-diagnose pypto-pro-op-orchestrator tilelang2ascendc-ops-generator triton-auto-evolve triton-optimizer)
+    CANNBOT_PLUGIN_DESCS+=("CAKE2 协同式 Ascend 核函数进化" "AscendC 算子多轮并行进化优化" "跨代际 AscendC 算子移植（arch22→arch35 等）" "PyTorch on NPU 训练精度诊断" "PyPTO-Pro 算子开发/验证/调优（6 专职 subagent）" "TileLang/设计表达自动生成 Ascend C 算子" "Triton-Ascend 算子多智能体自动优化" "Triton NPU 算子优化与转换")
+    CANNBOT_PLUGIN_KINDS+=(community community community community community community community community)
+    CANNBOT_PLUGIN_DIRS+=(collaborative-agent-kernel-evolution ascendc-ops-perf-evolution ascendc-port-orchestrator model-train-precision-diagnose pypto-pro-op-orchestrator tilelang2ascendc-ops-generator triton-auto-evolve triton-optimizer)
+}
+
+# 插件 ID -> 源码仓目录名（多数与 ID 同名；cake 特殊，目录是 collaborative-agent-kernel-evolution）
+_cannbot_plugin_dir() {
+    local id="$1" i
+    _cannbot_load_plugins
+    for i in "${!CANNBOT_PLUGIN_NAMES[@]}"; do
+        if [ "${CANNBOT_PLUGIN_NAMES[$i]}" = "${id}" ]; then
+            echo "${CANNBOT_PLUGIN_DIRS[$i]}"
+            return 0
+        fi
+    done
+    echo "${id}"
+}
+
+# CANNBot 插件勾选 TUI（与主菜单同款交互：↑↓ 移动 | 空格/x 勾选 | Enter 确认 | a 全选 | s 手输社区插件 | q 取消）
+# 结果写入全局数组 CANNBOT_SELECTED_PLUGINS；取消/未选任何插件返回 1
+select_cannbot_plugins() {
+    _cannbot_load_plugins
+    local -a extra=()
+    local n=${#CANNBOT_PLUGIN_NAMES[@]}
+    local cursor=0 i key mark desc custom
+    local _CHK=()
+    for ((i=0; i<n; i++)); do _CHK[$i]=0; done
+    # 预勾默认插件
+    for ((i=0; i<n; i++)); do
+        [ "${CANNBOT_PLUGIN_NAMES[$i]}" = "${DEFAULT_CANNBOT_PLUGIN}" ] && _CHK[$i]=1
+    done
+
+    tput civis 2>/dev/null  # 隐藏光标
+
+    while true; do
+        clear
+        echo "=================================="
+        echo -e "  ${GREEN}CANNBot 插件选择${NC}"
+        echo "=================================="
+        for ((i=0; i<n; i++)); do
+            if [ $i -eq 0 ]; then
+                echo -e "  ${GREEN}── 官方插件 ──${NC}"
+            elif [ $i -eq "${CANNBOT_OFFICIAL_COUNT}" ]; then
+                echo -e "  ${YELLOW}── 社区插件（实验孵化）──${NC}"
+            fi
+            if [ "${_CHK[$i]}" = "1" ]; then mark="✓"; else mark=" "; fi
+            desc="${CANNBOT_PLUGIN_NAMES[$i]} —— ${CANNBOT_PLUGIN_DESCS[$i]}"
+            if [ "${CANNBOT_PLUGIN_KINDS[$i]}" = "community" ]; then
+                desc="${desc}〔社区〕"
+            fi
+            if [ $i -eq $cursor ]; then
+                printf "\e[7m  [%s] %d. %s\e[0m\n" "$mark" "$((i+1))" "$desc"
+            else
+                printf "  [%s] %d. %s\n" "$mark" "$((i+1))" "$desc"
+            fi
+        done
+        if [ ${#extra[@]} -gt 0 ]; then
+            echo -e "  ${YELLOW}手动输入：${extra[*]}${NC}"
+        fi
+        echo "=================================="
+        echo -e "  ${YELLOW}↑↓ 移动 | 空格/x 勾选 | Enter 确认安装 | a 全选 | s 手输社区插件 | q 取消${NC}"
+
+        # 读取按键
+        IFS= read -rsn1 key
+
+        # 方向键：ESC [ A / ESC [ B
+        if [[ "$key" == $'\x1b' ]]; then
+            IFS= read -rsn2 -t 0.1 key
+            if [[ "$key" == "[A" ]]; then
+                ((cursor--)); [ $cursor -lt 0 ] && cursor=$((n-1))
+            elif [[ "$key" == "[B" ]]; then
+                ((cursor++)); [ $cursor -ge $n ] && cursor=0
+            fi
+            continue
+        fi
+
+        # 空格 或 x：切换勾选
+        if [[ "$key" == " " ]] || [[ "$key" == "x" ]]; then
+            if [ "${_CHK[$cursor]}" = "1" ]; then
+                _CHK[$cursor]=0
+            else
+                _CHK[$cursor]=1
+            fi
+            continue
+        fi
+
+        # Enter：确认
+        if [[ "$key" == "" ]]; then
+            break
+        fi
+
+        # a：全选
+        if [[ "$key" == "a" ]]; then
+            for ((i=0; i<n; i++)); do _CHK[$i]=1; done
+            continue
+        fi
+
+        # s：手动输入社区插件名
+        if [[ "$key" == "s" ]]; then
+            tput cnorm 2>/dev/null
+            read -e -p "社区插件名（回车空=返回）：" custom
+            custom=$(echo "${custom}" | xargs)
+            [ -n "${custom}" ] && extra+=("${custom}")
+            tput civis 2>/dev/null
+            continue
+        fi
+
+        # q：取消
+        if [[ "$key" == "q" ]]; then
+            tput cnorm 2>/dev/null
+            log_info "已取消 CANNBot 插件安装"
+            return 1
+        fi
+    done
+
+    tput cnorm 2>/dev/null  # 恢复光标
+
+    CANNBOT_SELECTED_PLUGINS=()
+    for ((i=0; i<n; i++)); do
+        [ "${_CHK[$i]}" = "1" ] && CANNBOT_SELECTED_PLUGINS+=("${CANNBOT_PLUGIN_NAMES[$i]}")
+    done
+    for i in "${!extra[@]}"; do
+        CANNBOT_SELECTED_PLUGINS+=("${extra[$i]}")
+    done
+    [ ${#CANNBOT_SELECTED_PLUGINS[@]} -gt 0 ]
+}
+
+# 安装 CANNBot 智能体插件（装入 claude/opencode/codex/trae/dsh 的配置目录）
+# 用法：install_cannbot [插件] [工具] [目录]；不带参数时弹勾选界面（可多选）
+# 优先 npm 安装：npx @cannbot-plugin/cannbot@latest install <插件> --tool <工具> --target <目录>
+# 失败回退源码：git clone https://gitcode.com/cann/cannbot.git + bash plugins-official/<插件>/init.sh
+install_cannbot() {
+    local plugin="${1:-}"
+    local tool="${2:-}"
+    local target="${3:-}"
+
+    echo -e "\n${GREEN}── 安装 CANNBot（官方插件装入 CLI 工具）──${NC}"
+
+    # CANNBot 的 npm CLI 与源码 init.sh 都依赖 node
+    ensure_cannbot_node || { log_fail "Node.js 就绪失败，终止"; return 1; }
+
+    # 选插件：命令行给了插件名就装单个；否则弹勾选界面（与主菜单同款交互）
+    local -a selected=()
+    if [ -n "${plugin}" ]; then
+        selected=("${plugin}")
+    else
+        select_cannbot_plugins || return 0
+        selected=("${CANNBOT_SELECTED_PLUGINS[@]}")
+    fi
+
+    # 选目标工具
+    if [ -z "${tool}" ]; then
+        read -e -p "目标工具 claude/opencode/codex/trae/dsh（默认 ${DEFAULT_CANNBOT_TOOL}）：" tool
+    fi
+    tool="${tool:-${DEFAULT_CANNBOT_TOOL}}"
+    tool=$(echo "${tool}" | xargs)
+    case "${tool}" in
+        claude|opencode|codex|trae|dsh) ;;
+        *) log_error "不支持的工具：${tool}（可选：claude/opencode/codex/trae/dsh）"; return 1 ;;
+    esac
+
+    # 选安装目录（插件装进该目录下的 .claude / .opencode 等）
+    if [ -z "${target}" ]; then
+        log_info "默认项目级安装（推荐）：装到算子工程目录，工作流说明(CLAUDE.md)与 skills 配套生效"
+        log_info "若填 \${HOME} 则为全局级：任何目录的 claude 都能加载 skills，但 ~/CLAUDE.md 不会被自动读取，且依赖仓会写进家目录"
+        read -e -p "安装目录（默认当前目录 $(pwd)）：" target
+    fi
+    target="${target:-$(pwd)}"
+    target=$(echo "${target}" | xargs)
+    mkdir -p "${target}" 2>/dev/null || { log_error "目录不可创建：${target}"; return 1; }
+
+    echo
+    log_info "插件：${selected[*]} | 工具：${tool} | 目录：${target}"
+    confirm_to_continue || return 0
+
+    # 逐个安装：优先 npm（npmmirror + 跳过 TLS 校验，仅作用于本条命令），失败回退源码
+    # 源码仓只 clone/更新一次，多个插件复用
+    local p src_ready=0 failed=0
+    local src_dir="${target}/cannbot"
+    for p in "${selected[@]}"; do
+        echo
+        log_info "── 安装插件 ${p} ──"
+        log_info "npm 安装中（npx @cannbot-plugin/cannbot@latest）..."
+        if NODE_TLS_REJECT_UNAUTHORIZED=0 npm_config_registry="${DEFAULT_NPM_REGISTRY}" npm_config_strict_ssl=false \
+            npx -y "@cannbot-plugin/cannbot@latest" install "${p}" --tool "${tool}" --target "${target}"; then
+            log_success "「${p}」已装入 ${tool}（npm 方式）"
+            continue
+        fi
+
+        # 源码回退：gitcode clone + init.sh
+        log_warn "npm 安装「${p}」失败，回退源码安装（${DEFAULT_CANNBOT_REPO}）..."
+        if [ "${src_ready}" = "0" ]; then
+            if [ -d "${src_dir}/.git" ]; then
+                git -C "${src_dir}" pull --recurse-submodules -q || log_warn "源码更新失败，使用现有副本"
+            else
+                if ! git clone --recurse-submodules --shallow-submodules "${DEFAULT_CANNBOT_REPO}" "${src_dir}"; then
+                    log_fail "源码 clone 失败（检查网络/代理后重试）"
+                    return 1
+                fi
+            fi
+            src_ready=1
+        fi
+        # 源码安装：按插件 ID 找 init.sh（社区插件目录名可能不同，如 cake）
+        local p_dir init_sh
+        p_dir="$(_cannbot_plugin_dir "${p}")"
+        init_sh="${src_dir}/plugins-official/${p_dir}/init.sh"
+        [ -f "${init_sh}" ] || init_sh="${src_dir}/plugins-community/${p_dir}/init.sh"
+        if [ ! -f "${init_sh}" ]; then
+            log_fail "源码里找不到插件 ${p} 的 init.sh（${p_dir}），继续下一个插件"
+            failed=1
+            continue
+        fi
+        if ! bash "${init_sh}" "${target}" "${tool}"; then
+            log_fail "源码安装失败（init.sh ${p} ${tool}），继续下一个插件"
+            failed=1
+            continue
+        fi
+        log_success "「${p}」已装入 ${tool}（源码方式）"
+    done
+
+    echo
+    if [ "${failed}" = "1" ]; then
+        log_warn "部分插件安装失败，可重新执行本项重试"
+    else
+        log_success "CANNBot 插件安装完成：${selected[*]}"
+    fi
+    log_info "启动：cd ${target} && ${tool}，对话中使用对应工作流即可"
     return 0
 }
 
@@ -2330,7 +2632,7 @@ install_clawd_pet() {
 
 # TUI 多选菜单（上下键导航，空格/x 多选，回车确认）
 show_tui_menu() {
-    local n=14
+    local n=15
     local cursor=0
     local i key mark
     local node_platform
@@ -2342,16 +2644,17 @@ show_tui_menu() {
     local opt2="安装vllm-ascend"
     local opt3="一键安装vllm+vllm-ascend"
     local opt4="一键安装CANNBot依赖（Python/CANN/PyTorch/torch_npu/tilelang）"
-    local opt5="创建vllm容器"
-    local opt6="万能杀"
-    local opt7="停止所有运行容器"
-    local opt8="看看谁在用卡"
-    local opt9="安装 Claude Code"
-    local opt10="安装 Codex CLI"
-    local opt11="安装终端桌宠（需先装 Claude Code）"
-    local opt12="清除代理"
-    local opt13="卸载 Claude Code"
-    local opt14="退出"
+    local opt5="安装CANNBot"
+    local opt6="创建vllm容器"
+    local opt7="万能杀"
+    local opt8="停止所有运行容器"
+    local opt9="看看谁在用卡"
+    local opt10="安装 Claude Code"
+    local opt11="安装 Codex CLI"
+    local opt12="安装终端桌宠（需先装 Claude Code）"
+    local opt13="清除代理"
+    local opt14="卸载 Claude Code"
+    local opt15="退出"
 
     # 选中状态（全局数组，0=未选 1=已选）
     _TUI_CHK=()
@@ -2373,13 +2676,15 @@ show_tui_menu() {
         printf "  ${GREEN}%-15s${NC} Node %s | npm %s | 包 %s\n" "[Codex CLI]" "$DEFAULT_NODE_VERSION ($node_platform)" "$DEFAULT_NPM_REGISTRY" "$CODEX_PACKAGE"
         printf "  ${GREEN}%-15s${NC} 容器 %s | 镜像 %s ${YELLOW}(创建新容器时的默认配置)${NC}\n" "[Docker]" "$DEFAULT_CONTAINER_NAME" "$DEFAULT_IMAGE_ID"
         printf "  ${GREEN}%-15s${NC} torch/torch_npu %s | PyPI %s | tilelang %s\n" "[CANNBot]" "$TORCH_VERSION_PIN" "$PIP_INDEX" "$TILELANG_INSTALL_DIR"
+        printf "  ${GREEN}%-15s${NC} 插件 %s | 工具 %s | 仓库 %s\n" "[CANNBot插件]" "$DEFAULT_CANNBOT_PLUGIN" "$DEFAULT_CANNBOT_TOOL" "$DEFAULT_CANNBOT_REPO"
         echo "----------------------------------"
         for ((i=0; i<n; i++)); do
             case $i in
                 0) desc="$opt1" ;; 1) desc="$opt2" ;; 2) desc="$opt3" ;;
                 3) desc="$opt4" ;; 4) desc="$opt5" ;; 5) desc="$opt6" ;;
                 6) desc="$opt7" ;; 7) desc="$opt8" ;; 8) desc="$opt9" ;;
-                9) desc="$opt10" ;; 10) desc="$opt11" ;; 11) desc="$opt12" ;; 12) desc="$opt13" ;; 13) desc="$opt14" ;;
+                9) desc="$opt10" ;; 10) desc="$opt11" ;; 11) desc="$opt12" ;;
+                12) desc="$opt13" ;; 13) desc="$opt14" ;; 14) desc="$opt15" ;;
             esac
             if [ "${_TUI_CHK[$i]}" = "1" ]; then
                 mark="✓"
@@ -2426,7 +2731,7 @@ show_tui_menu() {
 
         # a：全选（不含退出与卸载）
         if [[ "$key" == "a" ]]; then
-            for ((i=0; i<n-1; i++)); do [ $i -eq 12 ] && continue; _TUI_CHK[$i]=1; done
+            for ((i=0; i<n-1; i++)); do [ $i -eq 13 ] && continue; _TUI_CHK[$i]=1; done
             continue
         fi
 
@@ -2479,33 +2784,36 @@ main() {
                     install_cannbot_deps
                     ;;
                 5)
-                    create_vllm_container
+                    install_cannbot
                     ;;
                 6)
-                    kill_all_related_process
+                    create_vllm_container
                     ;;
                 7)
-                    stop_all_containers
+                    kill_all_related_process
                     ;;
                 8)
-                    check_npu_occupancy
+                    stop_all_containers
                     ;;
                 9)
-                    install_claude_code "$DEFAULT_CLAUDE_CODE_INSTALL_DIR"
+                    check_npu_occupancy
                     ;;
                 10)
-                    install_codex_cli "$DEFAULT_CODEX_INSTALL_DIR"
+                    install_claude_code "$DEFAULT_CLAUDE_CODE_INSTALL_DIR"
                     ;;
                 11)
-                    install_clawd_pet
+                    install_codex_cli "$DEFAULT_CODEX_INSTALL_DIR"
                     ;;
                 12)
-                    clear_proxy
+                    install_clawd_pet
                     ;;
                 13)
-                    uninstall_claude_code
+                    clear_proxy
                     ;;
                 14)
+                    uninstall_claude_code
+                    ;;
+                15)
                     log_info "退出脚本"
                     exit 0
                     ;;
@@ -2546,6 +2854,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 install_cannbot_deps || exit 1
                 exit 0
                 ;;
+            --install-cannbot)
+                install_cannbot "${2:-}" "${3:-$DEFAULT_CANNBOT_TOOL}" "${4:-}"
+                exit 0
+                ;;
             --install-claude-code)
                 install_claude_code "${2:-$DEFAULT_CLAUDE_CODE_INSTALL_DIR}"
                 exit 0
@@ -2575,6 +2887,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 echo "选项:"
                 echo "  --check-npu                            查看NPU占用者"
                 echo "  --install-cannbot-deps                 一键安装CANNBot依赖（Python/CANN检查/PyTorch+torch_npu/tilelang）"
+                echo "  --install-cannbot [插件] [工具] [目录]  安装CANNBot智能体插件（工具: claude/opencode/codex/trae/dsh，默认 $DEFAULT_CANNBOT_TOOL；目录默认当前目录=项目级）"
                 echo "  --install-vllm [DIR] [REPO] [BRANCH]   安装vllm（默认: 当前目录, $DEFAULT_VLLM_REPO, $DEFAULT_VLLM_BRANCH）"
                 echo "  --install-vllm-ascend [DIR] [REPO] [BRANCH]  安装vllm-ascend（默认: 当前目录, $DEFAULT_VLLM_ASCEND_REPO, $DEFAULT_VLLM_ASCEND_BRANCH）"
                 echo "  --install-vllm-all [DIR]               一键安装vllm+vllm-ascend（默认: 当前目录）"
